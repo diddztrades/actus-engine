@@ -1,73 +1,97 @@
-# React + TypeScript + Vite
+# ACTUS Engine
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+ACTUS Engine is a real-time market decision system designed to translate market data, options positioning, and price behavior into clear trading decisions.
 
-Currently, two official plugins are available:
+⚡ Work in progress — evolving rapidly
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+---
 
-## React Compiler
+## What ACTUS Does
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+ACTUS is built to interpret markets through:
 
-## Expanding the ESLint configuration
+- Futures market data (Databento)
+- Options positioning (gamma)
+- Price behavior and structure
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+It outputs:
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+- Regime → PIN / EXPANSION  
+- Bias → LONG / SHORT / NEUTRAL  
+- Condition → MEAN_REVERSION / BREAKOUT / TRAP  
+- Confidence → decision strength  
+- Alignment → positioning vs price agreement  
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+---
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+## System Overview
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### Chart Engine
+- Real-time candles (1m / 5m / 15m / 1h)
+- Stable rendering
+- Contiguous minute reconstruction
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+### Positioning Layer
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+- REAL_GAMMA → NQ (CME), BTC (Deribit)
+- POSITIONING_PROXY → XAU, OIL, others
+- Clean separation — no fake gamma
+
+### Decision Engine
+
+Outputs structured decisions:
+
+{
+  "regime": "EXPANSION",
+  "bias": "LONG",
+  "confidence": 0.73,
+  "condition": "BREAKOUT",
+  "alignment": "STRONG"
+}
+
+---
+
+## Current Status
+
+🚧 Active development
+
+Focus areas:
+- Expanding CME options coverage (XAU / OIL)
+- Gamma reliability
+- Decision confidence scoring
+- Performance and UX improvements
+
+---
+
+## Tech Stack
+
+- React + TypeScript
+- Vite
+- Node backend
+- Databento (futures + CME options)
+- Deribit (crypto options)
+
+---
+
+## Security
+
+- No API keys stored in repo  
+- Uses .env for credentials  
+- Safe for public viewing  
+
+---
+
+## Philosophy
+
+ACTUS is not:
+- an indicator
+- a charting tool
+
+It is:
+→ a decision engine
+
+---
+
+## Author
+
+Built by diddztrades
