@@ -15,6 +15,7 @@ import {
 } from "lightweight-charts";
 import { ACTUS_VISIBLE_BARS, formatActusAxisTime, formatActusTickMark } from "../lib/actusChartConfig";
 import type { GammaOverlay, TimeframeFilter } from "../types/chart";
+import type { DeltaSignal } from "../types/delta";
 import type { NormalizedFuturesCandle } from "../types/market";
 import { Sentry } from "../sentry";
 
@@ -28,6 +29,7 @@ type Props = {
   entry?: number;
   invalidation?: number;
   gammaOverlay?: GammaOverlay | null;
+  deltaSignal?: DeltaSignal | null;
 };
 
 function buildCandlestickData(candles: NormalizedFuturesCandle[]) {
@@ -131,7 +133,83 @@ function symbolPriceFormat(symbol: string | undefined) {
   return { precision: 2, minMove: 0.01 };
 }
 
-export function ActusChart({ symbol, candles, timeframe, height, entry, invalidation, gammaOverlay }: Props) {
+function deltaVisualTone(signal: DeltaSignal | null) {
+  if (signal?.deltaAvailability === "DIRECTIONAL") {
+    const bullish = signal.bias === "LONG" || signal.condition === "ACCUMULATION";
+    return {
+      label: "Delta Directional",
+      color: bullish ? "#d7ffea" : "#ffd7e2",
+      accent: bullish ? "#45ffb5" : "#ff8ea8",
+      background: bullish ? "rgba(69,255,181,0.1)" : "rgba(255,142,168,0.1)",
+      border: bullish ? "rgba(69,255,181,0.22)" : "rgba(255,142,168,0.22)",
+    };
+  }
+  if (signal?.deltaAvailability === "SOURCE_ONLY") {
+    return {
+      label: "Delta Source Only",
+      color: "#d8e7ff",
+      accent: "#67b7ff",
+      background: "rgba(103,183,255,0.1)",
+      border: "rgba(103,183,255,0.2)",
+    };
+  }
+  if (signal?.deltaAvailability === "UNSUPPORTED") {
+    return {
+      label: "Delta Unsupported",
+      color: "#b8c6de",
+      accent: "#8ea0bf",
+      background: "rgba(142,160,191,0.08)",
+      border: "rgba(142,160,191,0.16)",
+    };
+  }
+  return {
+    label: "Delta Unavailable",
+    color: "#d3c1cb",
+    accent: "#ff9db3",
+    background: "rgba(255,111,145,0.07)",
+    border: "rgba(255,111,145,0.14)",
+  };
+}
+
+function deltaVisualSummary(signal: DeltaSignal | null) {
+  if (!signal) {
+    return {
+      title: "Delta waiting",
+      detail: "Awaiting source",
+    };
+  }
+
+  if (signal.deltaAvailability === "DIRECTIONAL") {
+    const bias = signal.bias ?? "NEUTRAL";
+    const condition = (signal.condition ?? "NEUTRAL").replace("_", " ");
+    const strength = `${Math.round((signal.strength ?? 0) * 100)}%`;
+    return {
+      title: bias === "NEUTRAL" ? "Directional flow" : `${bias} flow`,
+      detail: `${condition} • ${strength}`,
+    };
+  }
+
+  if (signal.deltaAvailability === "SOURCE_ONLY") {
+    return {
+      title: "Flow present",
+      detail: "Non-directional source",
+    };
+  }
+
+  if (signal.deltaAvailability === "UNSUPPORTED") {
+    return {
+      title: "Delta unsupported",
+      detail: "Not in current stack",
+    };
+  }
+
+  return {
+    title: "No delta read",
+    detail: "No usable source",
+  };
+}
+
+export function ActusChart({ symbol, candles, timeframe, height, entry, invalidation, gammaOverlay, deltaSignal }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick", Time> | null>(null);
@@ -179,6 +257,8 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
   const traceKey = useMemo(() => actusTraceKey(symbol, timeframe), [symbol, timeframe]);
   const [atLiveEdge, setAtLiveEdge] = useState(true);
   const priceFormat = useMemo(() => symbolPriceFormat(symbol), [symbol]);
+  const deltaTone = useMemo(() => deltaVisualTone(deltaSignal ?? null), [deltaSignal]);
+  const deltaSummary = useMemo(() => deltaVisualSummary(deltaSignal ?? null), [deltaSignal]);
 
   const tickMarkFormatter = useCallback((time: Time, _tickMarkType: TickMarkType, _locale: string) => {
     return formatActusTickMark(time, _tickMarkType, _locale, timeframe);
@@ -647,6 +727,53 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
           }}
         />
         <span>{atLiveEdge ? "Live Edge" : "Manual View"}</span>
+      </div>
+      <div
+        style={{
+          position: "absolute",
+          left: 10,
+          bottom: 10,
+          zIndex: 2,
+          display: "grid",
+          gap: 3,
+          minWidth: 0,
+          maxWidth: "46%",
+          padding: "7px 9px",
+          borderRadius: 12,
+          background: deltaTone.background,
+          border: `1px solid ${deltaTone.border}`,
+          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.025)",
+          pointerEvents: "none",
+          backdropFilter: "blur(4px)",
+          opacity: 0.94,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+          <span
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: 999,
+              background: deltaTone.accent,
+              boxShadow: `0 0 8px ${deltaTone.accent}`,
+              flex: "0 0 auto",
+            }}
+          />
+          <span
+            style={{
+              fontSize: 10,
+              color: deltaTone.color,
+              letterSpacing: "0.1em",
+              textTransform: "uppercase",
+              fontWeight: 800,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {deltaTone.label}
+          </span>
+        </div>
+        <div style={{ fontSize: 11, color: "#eef4ff", fontWeight: 700, lineHeight: 1.2 }}>{deltaSummary.title}</div>
+        <div style={{ fontSize: 10, color: "#b8c6de", lineHeight: 1.2 }}>{deltaSummary.detail}</div>
       </div>
       <div ref={containerRef} style={{ width: "100%", minWidth: 0, height, minHeight: height, display: "block" }} />
     </div>

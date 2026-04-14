@@ -72,6 +72,13 @@ type ActusModeLiveChartState = {
   updatedAt: number | null;
 };
 
+type ActusReplayState = {
+  isReplayMode: boolean;
+  isPlaying: boolean;
+  replayIndex: number;
+  replaySpeed: number;
+};
+
 type ProductPrefs = {
   favorites: string[];
   alertEnabledByAsset: Record<string, boolean>;
@@ -89,6 +96,35 @@ type InAppAlert = {
   body: string;
   tone: InAppAlertTone;
   createdAt: number;
+};
+
+type ActusInternalAlertEventType =
+  | "bias-change"
+  | "confidence-threshold"
+  | "condition-change"
+  | "positioning-change"
+  | "delta-directional";
+
+type ActusInternalAlertSnapshot = {
+  symbol: string;
+  timeframe: TimeframeFilter;
+  bias: "LONG" | "SHORT" | "NEUTRAL";
+  confidenceScore: number;
+  confidenceBand: "LOW" | "MEDIUM" | "HIGH";
+  condition: "BREAKOUT" | "MEAN_REVERSION" | "TRAP";
+  positioningType: ActusPositioning["positioningType"] | null;
+  deltaAvailability: DeltaSignal["deltaAvailability"] | null;
+  deltaDirectionalAvailable: boolean;
+  deltaBias: DeltaSignal["bias"] | null;
+};
+
+type ActusInternalAlertEvent = {
+  id: string;
+  asset: string;
+  timestamp: number;
+  eventType: ActusInternalAlertEventType;
+  snapshot: ActusInternalAlertSnapshot;
+  previousSnapshot: ActusInternalAlertSnapshot | null;
 };
 
 type SetupOutcome = "completed" | "invalidated" | "not-triggered" | "exited-early";
@@ -147,6 +183,8 @@ const OPEN_POSITIONS_KEY = "actus-open-positions-v1";
 const CLOSED_POSITIONS_KEY = "actus-closed-positions-v1";
 const MAX_SETUP_HISTORY = 10;
 const ALERT_THROTTLE_MS = 90_000;
+const DEFAULT_REPLAY_SPEED = 1000;
+const REPLAY_SPEEDS = [1400, 900, 500] as const;
 const DEFAULT_PRODUCT_PREFS: ProductPrefs = {
   favorites: [],
   alertEnabledByAsset: {},
@@ -348,6 +386,97 @@ function alertPayload(
 
 function isAlertEnabledForAsset(prefs: ProductPrefs, symbol: string) {
   return prefs.alertEnabledByAsset[symbol] ?? true;
+}
+
+function deriveActusAlertBias(item: ActusOpportunityOutput): "LONG" | "SHORT" | "NEUTRAL" {
+  if (item.direction === "long") return "LONG";
+  if (item.direction === "short") return "SHORT";
+  return "NEUTRAL";
+}
+
+function deriveActusAlertCondition(item: ActusOpportunityOutput): "BREAKOUT" | "MEAN_REVERSION" | "TRAP" {
+  if (item.tooLateFlag || item.riskState === "late" || item.state === "failed-breakout" || item.state === "invalidated") {
+    return "TRAP";
+  }
+  if (item.state === "breakout" || item.state === "continuation" || item.state === "execute") {
+    return "BREAKOUT";
+  }
+  return "MEAN_REVERSION";
+}
+
+function deriveAlertConfidenceBand(score: number): "LOW" | "MEDIUM" | "HIGH" {
+  if (score >= 70) return "HIGH";
+  if (score >= 40) return "MEDIUM";
+  return "LOW";
+}
+
+function buildInternalAlertSnapshot(
+  item: ActusOpportunityOutput,
+  options?: {
+    positioningType?: ActusPositioning["positioningType"] | null;
+    deltaSignal?: DeltaSignal | null;
+  },
+): ActusInternalAlertSnapshot {
+  return {
+    symbol: item.symbol,
+    timeframe: item.timeframe,
+    bias: deriveActusAlertBias(item),
+    confidenceScore: item.confidenceScore,
+    confidenceBand: deriveAlertConfidenceBand(item.confidenceScore),
+    condition: deriveActusAlertCondition(item),
+    positioningType: options?.positioningType ?? null,
+    deltaAvailability: options?.deltaSignal?.deltaAvailability ?? null,
+    deltaDirectionalAvailable: options?.deltaSignal?.deltaDirectionalAvailable ?? false,
+    deltaBias: options?.deltaSignal?.bias ?? null,
+  };
+}
+
+function buildInternalAlertEvents(
+  previousSnapshot: ActusInternalAlertSnapshot | null,
+  nextSnapshot: ActusInternalAlertSnapshot,
+) {
+  if (!previousSnapshot) {
+    return [] as Array<{ eventType: ActusInternalAlertEventType; signature: string }>;
+  }
+
+  const events: Array<{ eventType: ActusInternalAlertEventType; signature: string }> = [];
+
+  if (previousSnapshot.bias !== nextSnapshot.bias) {
+    events.push({
+      eventType: "bias-change",
+      signature: `${nextSnapshot.symbol}:bias:${previousSnapshot.bias}->${nextSnapshot.bias}`,
+    });
+  }
+
+  if (previousSnapshot.confidenceBand !== nextSnapshot.confidenceBand) {
+    events.push({
+      eventType: "confidence-threshold",
+      signature: `${nextSnapshot.symbol}:confidence:${previousSnapshot.confidenceBand}->${nextSnapshot.confidenceBand}`,
+    });
+  }
+
+  if (previousSnapshot.condition !== nextSnapshot.condition) {
+    events.push({
+      eventType: "condition-change",
+      signature: `${nextSnapshot.symbol}:condition:${previousSnapshot.condition}->${nextSnapshot.condition}`,
+    });
+  }
+
+  if (previousSnapshot.positioningType !== nextSnapshot.positioningType && nextSnapshot.positioningType !== null) {
+    events.push({
+      eventType: "positioning-change",
+      signature: `${nextSnapshot.symbol}:positioning:${previousSnapshot.positioningType ?? "NONE"}->${nextSnapshot.positioningType}`,
+    });
+  }
+
+  if (!previousSnapshot.deltaDirectionalAvailable && nextSnapshot.deltaDirectionalAvailable) {
+    events.push({
+      eventType: "delta-directional",
+      signature: `${nextSnapshot.symbol}:delta:${previousSnapshot.deltaAvailability ?? "NONE"}->${nextSnapshot.deltaAvailability ?? "NONE"}:${nextSnapshot.deltaBias ?? "NEUTRAL"}`,
+    });
+  }
+
+  return events;
 }
 
 function replayOutcomeTone(outcome: SetupOutcome) {
@@ -601,6 +730,38 @@ function resolveActusLiveAsset(item: ActusOpportunityOutput | null) {
   if (normalizedSymbol === "GC" || normalizedSymbol === "XAU" || normalizedSymbol === "XAUUSD" || normalizedName.includes("GOLD")) return "GC";
 
   return null;
+}
+
+function buildReplaySafeDeltaSignal(symbol: string): DeltaSignal {
+  const normalized = symbol.toUpperCase();
+  const supported =
+    normalized === "NQ" ||
+    normalized === "GC" ||
+    normalized === "XAU" ||
+    normalized === "XAU/USD" ||
+    normalized === "XAUUSD" ||
+    normalized === "CL" ||
+    normalized === "OIL" ||
+    normalized === "BTC" ||
+    normalized === "BTC/USD";
+
+  return {
+    deltaAvailability: supported ? "UNAVAILABLE" : "UNSUPPORTED",
+    deltaSupportedAsset: supported,
+    deltaSourceAvailable: false,
+    deltaDirectionalAvailable: false,
+    bias: "NEUTRAL",
+    strength: 0,
+    condition: "NEUTRAL",
+    source: null,
+    updatedAt: null,
+  };
+}
+
+function replaySpeedLabel(speed: number) {
+  if (speed <= 500) return "4x";
+  if (speed <= 900) return "2x";
+  return "1x";
 }
 
 function readLiveCandleClose(candle: LiveDatabentoCandle) {
@@ -2153,8 +2314,14 @@ function actusModePanel(
   chartCandles: NormalizedFuturesCandle[] | null,
   gammaOverlay: GammaOverlay | null,
   deltaSignal: DeltaSignal | null,
+  replayState: ActusReplayState,
   nowTick: number,
   onExit: () => void,
+  onToggleReplayMode: () => void,
+  onReplayPlayPause: () => void,
+  onReplayStepBack: () => void,
+  onReplayStepForward: () => void,
+  onReplaySpeedCycle: () => void,
   position: OpenPositionRecord | null,
   closedPosition: ClosedPositionRecord | null,
   fillPriceDraft: string,
@@ -2247,6 +2414,10 @@ function actusModePanel(
   const positioningPill = positioningAvailabilityPill(unifiedPositioning);
   const decisionDrivers = unifiedPositioning?.drivers.slice(0, 2) ?? [];
   const deltaTone = deltaAvailabilityTone(deltaSignal);
+  const displayedConfidenceScore =
+    replayState.isReplayMode && unifiedPositioning
+      ? Math.round(unifiedPositioning.confidence * 100)
+      : item.confidenceScore;
   const tradeDelta = position
     ? {
         delta: position.side === "short" ? position.filledPrice - item.price : item.price - position.filledPrice,
@@ -2262,36 +2433,86 @@ function actusModePanel(
   const canMarkFilled = !position && !closedPosition && baseExecutionBlock.primary !== "DO NOT TRADE";
   const entryDisplay = position?.filledPrice ?? item.entry;
   const stopDisplay = position?.stop ?? item.invalidation;
+  const replayCandleCount = chartCandles?.length ?? 0;
   return (
     <section
       style={{
-        background: "linear-gradient(180deg, rgba(7,11,18,0.995), rgba(5,8,15,0.995))",
-        border: "1px solid rgba(132,151,186,0.14)",
-        borderRadius: 20,
-        padding: 16,
-        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03), 0 26px 80px rgba(0,0,0,0.34)",
+        background:
+          "radial-gradient(circle at top right, rgba(62,120,255,0.055), transparent 24%), linear-gradient(180deg, rgba(7,11,18,0.995), rgba(5,8,15,0.995))",
+        border: "1px solid rgba(132,151,186,0.12)",
+        borderRadius: 24,
+        padding: 18,
+        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03), 0 30px 90px rgba(0,0,0,0.34)",
         display: "grid",
-        gap: 12,
+        gap: 16,
       }}
     >
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center", flexWrap: "wrap", paddingBottom: 8, borderBottom: "1px solid rgba(142,160,191,0.08)" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <div style={{ fontSize: 28, fontWeight: 760, color: "#f4f7fb", letterSpacing: "-0.04em" }}>{item.symbol}</div>
-          <div style={{ fontSize: 15, fontWeight: 700, color: directionalTone.text, letterSpacing: "0.12em", textTransform: "uppercase" }}>{displayDirection(item.direction)}</div>
-          <div style={{ fontSize: 13, color: "#9fb0cb", letterSpacing: "0.08em", textTransform: "uppercase" }}>{displaySetupType(item.setupType)}</div>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 18,
+          alignItems: "flex-start",
+          flexWrap: "wrap",
+          paddingBottom: 10,
+          borderBottom: "1px solid rgba(142,160,191,0.07)",
+        }}
+      >
+        <div style={{ display: "grid", gap: 6, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
+            <div style={{ fontSize: 30, fontWeight: 780, color: "#f4f7fb", letterSpacing: "-0.045em", lineHeight: 1 }}>{item.symbol}</div>
+            <div style={{ fontSize: 14, fontWeight: 760, color: directionalTone.text, letterSpacing: "0.13em", textTransform: "uppercase" }}>
+              {displayDirection(item.direction)}
+            </div>
+            <div style={{ fontSize: 12, color: "#8ea0bf", letterSpacing: "0.11em", textTransform: "uppercase" }}>{displaySetupType(item.setupType)}</div>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>{item.timeframe}</div>
+            <div style={{ width: 4, height: 4, borderRadius: 999, background: "rgba(142,160,191,0.42)" }} />
+            <div style={{ fontSize: 12, color: "#9fb0cb", lineHeight: 1.35 }}>{item.summary}</div>
+          </div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+          {replayState.isReplayMode ? (
+            <div
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "7px 11px",
+                borderRadius: 999,
+                color: "#d8e7ff",
+                background: "rgba(103,183,255,0.1)",
+                border: "1px solid rgba(103,183,255,0.22)",
+                fontSize: 11,
+                letterSpacing: "0.08em",
+                textTransform: "uppercase",
+                fontWeight: 800,
+              }}
+            >
+              <span
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: 999,
+                  background: replayState.isPlaying ? "#67b7ff" : "#8ea0bf",
+                  boxShadow: replayState.isPlaying ? "0 0 10px rgba(103,183,255,0.72)" : "none",
+                }}
+              />
+              <span>{replayState.isPlaying ? "Replay Live" : "Replay Paused"}</span>
+            </div>
+          ) : null}
           <div
             style={{
-              fontSize: 13,
+              fontSize: 12,
               color: displayStatusTone.text,
               background: displayStatusTone.bg,
               border: `1px solid ${displayStatusTone.border}`,
               borderRadius: 999,
-              padding: "7px 12px",
-              letterSpacing: "0.1em",
+              padding: "7px 11px",
+              letterSpacing: "0.11em",
               textTransform: "uppercase",
-              fontWeight: 700,
+              fontWeight: 800,
             }}
           >
             {displayStatus}
@@ -2301,7 +2522,7 @@ function actusModePanel(
               display: "inline-flex",
               alignItems: "center",
               gap: 8,
-              padding: "7px 12px",
+              padding: "7px 11px",
               borderRadius: 999,
               color: positioningPill.color,
               background: positioningPill.background,
@@ -2310,7 +2531,7 @@ function actusModePanel(
               letterSpacing: "0.08em",
               textTransform: "uppercase",
               fontWeight: 800,
-              boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 18px ${positioningPill.background}`,
+              boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 16px ${positioningPill.background}`,
             }}
           >
             <span
@@ -2325,14 +2546,24 @@ function actusModePanel(
             />
             <span>{positioningPill.label}</span>
           </div>
+          {replayCandleCount > 1 ? ghostButton(replayState.isReplayMode ? "Live Mode" : "Replay Mode", onToggleReplayMode, replayState.isReplayMode ? "#67b7ff" : "#d7e1f4") : null}
           {position ? ghostButton("Position Closed", () => onClosePosition(item), "#ff9d66") : null}
           {ghostButton("Back To Board", onExit, "#d7e1f4")}
         </div>
       </div>
 
-      <div style={{ display: "grid", gap: 14 }}>
-        <div style={{ padding: "3px 3px 2px", background: "radial-gradient(circle at top right, rgba(98,196,255,0.06), transparent 28%), linear-gradient(180deg, rgba(8,12,22,0.7), rgba(4,7,14,0.88))", borderRadius: 12, border: "1px solid rgba(132,151,186,0.08)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.02)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 6, flexWrap: "wrap", padding: "0 6px" }}>
+      <div style={{ display: "grid", gap: 16 }}>
+        <div
+          style={{
+            padding: "4px 4px 3px",
+            background:
+              "radial-gradient(circle at top right, rgba(98,196,255,0.055), transparent 26%), linear-gradient(180deg, rgba(8,12,22,0.72), rgba(4,7,14,0.9))",
+            borderRadius: 14,
+            border: "1px solid rgba(132,151,186,0.08)",
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.02)",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 8, flexWrap: "wrap", padding: "0 8px" }}>
             <div style={{ fontSize: 13, fontWeight: 600, color: "#f4f7fb" }}>
               {item.symbol}
               <span style={{ marginLeft: 8, fontFamily: '"Courier New", monospace', color: "#d7e1f4" }}>{item.price.toLocaleString()}</span>
@@ -2343,15 +2574,124 @@ function actusModePanel(
             </div>
             <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.08em", textTransform: "uppercase" }}>{item.timeframe}</div>
           </div>
-          <div style={{ borderRadius: 10, overflow: "hidden", background: "linear-gradient(180deg, rgba(12,18,30,0.42), rgba(8,12,22,0.84))", minHeight: 278 }}>
+          {replayState.isReplayMode ? (
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 12,
+                alignItems: "flex-start",
+                flexWrap: "wrap",
+                marginBottom: 10,
+                padding: "0 8px",
+              }}
+            >
+              <div style={{ display: "grid", gap: 7, minWidth: 220, flex: "1 1 280px" }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <div
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 8,
+                      padding: "6px 10px",
+                      borderRadius: 999,
+                      background: "rgba(103,183,255,0.1)",
+                      border: "1px solid rgba(103,183,255,0.22)",
+                      color: "#d8e7ff",
+                      fontSize: 10,
+                      letterSpacing: "0.1em",
+                      textTransform: "uppercase",
+                      fontWeight: 800,
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: 999,
+                        background: replayState.isPlaying ? "#67b7ff" : "#8ea0bf",
+                        boxShadow: replayState.isPlaying ? "0 0 10px rgba(103,183,255,0.72)" : "none",
+                      }}
+                    />
+                    <span>{replayState.isPlaying ? "Playing" : "Paused"}</span>
+                  </div>
+                  <div
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "6px 10px",
+                      borderRadius: 999,
+                      background: "rgba(255,255,255,0.03)",
+                      border: "1px solid rgba(142,160,191,0.12)",
+                      color: "#c8d5ee",
+                      fontSize: 10,
+                      letterSpacing: "0.09em",
+                      textTransform: "uppercase",
+                      fontWeight: 800,
+                    }}
+                  >
+                    <span>Speed</span>
+                    <span style={{ color: "#f4f7fb" }}>{replaySpeedLabel(replayState.replaySpeed)}</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#b8c6de", fontWeight: 700 }}>
+                    Candle {replayState.replayIndex + 1} of {replayCandleCount}
+                  </div>
+                </div>
+                <div style={{ display: "grid", gap: 5 }}>
+                  <div
+                    style={{
+                      height: 6,
+                      borderRadius: 999,
+                      overflow: "hidden",
+                      background: "rgba(255,255,255,0.045)",
+                      border: "1px solid rgba(142,160,191,0.08)",
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${Math.max(2, ((replayState.replayIndex + 1) / Math.max(replayCandleCount, 1)) * 100)}%`,
+                        height: "100%",
+                        borderRadius: 999,
+                        background: "linear-gradient(90deg, rgba(103,183,255,0.86), rgba(69,255,181,0.86))",
+                        boxShadow: "0 0 14px rgba(103,183,255,0.22)",
+                      }}
+                    />
+                  </div>
+                  <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                    Replay re-runs the ACTUS read candle by candle with no future leakage
+                  </div>
+                </div>
+              </div>
+              <div
+                style={{
+                  display: "inline-flex",
+                  gap: 8,
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  padding: "6px",
+                  borderRadius: 14,
+                  background: "rgba(5,9,16,0.38)",
+                  border: "1px solid rgba(118,138,176,0.1)",
+                }}
+              >
+                {ghostButton("Back", onReplayStepBack, "#8ea0bf")}
+                {ghostButton(replayState.isPlaying ? "Pause" : "Play", onReplayPlayPause, replayState.isPlaying ? "#67b7ff" : "#45ffb5")}
+                {ghostButton("Step", onReplayStepForward, "#d7e1f4")}
+                {ghostButton(`Speed ${replaySpeedLabel(replayState.replaySpeed)}`, onReplaySpeedCycle, "#8ea0bf")}
+              </div>
+            </div>
+          ) : null}
+          <div style={{ borderRadius: 12, overflow: "hidden", background: "linear-gradient(180deg, rgba(12,18,30,0.42), rgba(8,12,22,0.84))", minHeight: 286 }}>
             <ActusChart
               symbol={item.symbol}
               candles={chartCandles}
               timeframe={item.timeframe}
-              height={278}
+              height={286}
               entry={entryDisplay}
               invalidation={stopDisplay}
               gammaOverlay={chartGammaOverlay}
+              deltaSignal={deltaSignal}
             />
           </div>
         </div>
@@ -2359,14 +2699,14 @@ function actusModePanel(
         <div
           style={{
             display: "grid",
-            gap: 8,
-            padding: "10px 12px",
-            borderRadius: 12,
+            gap: 10,
+            padding: "12px 14px",
+            borderRadius: 14,
             background: "linear-gradient(180deg, rgba(10,14,25,0.62), rgba(5,8,14,0.84))",
             border: "1px solid rgba(118,138,176,0.08)",
           }}
         >
-          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.2fr) minmax(240px, 0.8fr) minmax(190px, 0.7fr)", gap: 12, alignItems: "start" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.34fr) minmax(240px, 0.78fr) minmax(196px, 0.68fr)", gap: 14, alignItems: "start" }}>
             <div style={{ display: "grid", gap: 8 }}>
               <div style={{ fontSize: 11, color: displayStatusTone.text, letterSpacing: "0.1em", textTransform: "uppercase" }}>
                 {position ? "Position" : liveStatus === "IN TRADE" || liveStatus === "READY" ? "Execution" : liveStatus === "EXIT SOON" ? "Urgent" : "Decision"}
@@ -2431,7 +2771,7 @@ function actusModePanel(
                       "radial-gradient(circle at top right, rgba(255,224,130,0.08), transparent 28%), linear-gradient(180deg, rgba(10,15,25,0.88), rgba(7,11,19,0.97))",
                     border: "1px solid rgba(118,138,176,0.16)",
                     boxShadow: "inset 0 1px 0 rgba(255,255,255,0.035), 0 12px 28px rgba(0,0,0,0.18)",
-                    maxWidth: 680,
+                    maxWidth: 700,
                   }}
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
@@ -2653,7 +2993,7 @@ function actusModePanel(
                 </div>
               ) : null}
             </div>
-            <div style={{ padding: "9px 10px", borderRadius: 10, background: "linear-gradient(180deg, rgba(10,14,25,0.46), rgba(5,8,14,0.72))", border: "1px solid rgba(118,138,176,0.1)", display: "grid", gap: 6 }}>
+            <div style={{ padding: "10px 11px", borderRadius: 12, background: "linear-gradient(180deg, rgba(10,14,25,0.46), rgba(5,8,14,0.72))", border: "1px solid rgba(118,138,176,0.1)", display: "grid", gap: 7 }}>
               <div style={{ display: "grid", gap: 2 }}>
                 <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.08em", textTransform: "uppercase" }}>Position Status</div>
                 <div style={{ fontSize: 13, color: "#f4f7fb", lineHeight: 1.35, fontWeight: 600 }}>
@@ -2676,11 +3016,11 @@ function actusModePanel(
               </div>
             </div>
             <div style={{ display: "grid", gap: 10 }}>
-              <div style={{ padding: "9px 10px", borderRadius: 10, background: "linear-gradient(180deg, rgba(8,15,20,0.62), rgba(3,9,12,0.82))", border: "1px solid rgba(62,240,166,0.16)" }}>
+              <div style={{ padding: "10px 11px", borderRadius: 12, background: "linear-gradient(180deg, rgba(8,15,20,0.62), rgba(3,9,12,0.82))", border: "1px solid rgba(62,240,166,0.16)" }}>
                 <div style={{ fontSize: 10, color: "#3ef0a6", letterSpacing: "0.1em", textTransform: "uppercase", fontWeight: 700 }}>Entry Zone</div>
                 <div style={{ marginTop: 5, fontSize: 18, color: "#f4f7fb", fontWeight: 700 }}>{entryDisplay.toLocaleString()}</div>
               </div>
-              <div style={{ padding: "9px 10px", borderRadius: 10, background: "linear-gradient(180deg, rgba(20,8,14,0.62), rgba(12,3,7,0.82))", border: "1px solid rgba(255,111,145,0.16)" }}>
+              <div style={{ padding: "10px 11px", borderRadius: 12, background: "linear-gradient(180deg, rgba(20,8,14,0.62), rgba(12,3,7,0.82))", border: "1px solid rgba(255,111,145,0.16)" }}>
                 <div style={{ fontSize: 10, color: "#ff6f91", letterSpacing: "0.1em", textTransform: "uppercase", fontWeight: 700 }}>Stop</div>
                 <div style={{ marginTop: 5, fontSize: 18, color: "#f4f7fb", fontWeight: 700 }}>{stopDisplay.toLocaleString()}</div>
               </div>
@@ -2688,7 +3028,7 @@ function actusModePanel(
           </div>
         </div>
 
-        <div style={{ padding: "10px 12px", borderRadius: 12, background: "rgba(255,255,255,0.014)", border: "1px solid rgba(142,160,191,0.06)" }}>
+        <div style={{ padding: "11px 13px", borderRadius: 14, background: "rgba(255,255,255,0.014)", border: "1px solid rgba(142,160,191,0.06)" }}>
               <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>{position ? "Management Read" : actusReadTitle(executionState)}</div>
           <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
             {executionRead.slice(0, 3).map((line) => (
@@ -2699,15 +3039,15 @@ function actusModePanel(
           </div>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
-          {compactMetricCard("Confidence", `${item.confidenceScore}%`, undefined, colors.text)}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10 }}>
+          {compactMetricCard("Confidence", `${displayedConfidenceScore}%`, replayState.isReplayMode ? "Replay step" : undefined, colors.text)}
           {compactMetricCard("Opportunity", `${item.opportunityScore}`, undefined, "#d7e1f4")}
           {compactMetricCard("Freshness", perceivedFreshnessState(item), actusFreshnessDetail(item, nowTick), actusFreshnessTone(item))}
           {compactMetricCard("Risk", displayRisk(item.riskState), undefined, riskColor)}
         </div>
 
         {(riskWatchLines.length || positioningLines.length) ? (
-          <div style={{ padding: "10px 12px", borderRadius: 12, background: "rgba(255,255,255,0.014)", border: "1px solid rgba(142,160,191,0.06)", display: "grid", gap: 5 }}>
+          <div style={{ padding: "11px 13px", borderRadius: 14, background: "rgba(255,255,255,0.014)", border: "1px solid rgba(142,160,191,0.06)", display: "grid", gap: 5 }}>
             <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Watch / Risk</div>
             {riskWatchLines.map((line) => (
               <div key={line} style={{ fontSize: 14, color: "#f0c4c4", lineHeight: 1.4, fontWeight: 600 }}>
@@ -2797,6 +3137,12 @@ export default function App() {
   const { snapshot, loading, hasCachedInputs, refresh } = useActusPlatform(selectedTimeframe);
   const [viewMode, setViewMode] = useState<ViewMode>("focus");
   const [actusModeSelection, setActusModeSelection] = useState<ActusModeSelection | null>(null);
+  const [actusReplayState, setActusReplayState] = useState<ActusReplayState>({
+    isReplayMode: false,
+    isPlaying: false,
+    replayIndex: 0,
+    replaySpeed: DEFAULT_REPLAY_SPEED,
+  });
   const [actusModeLiveChart, setActusModeLiveChart] = useState<ActusModeLiveChartState>({
     supported: false,
     connected: false,
@@ -2811,6 +3157,7 @@ export default function App() {
   const [nowTick, setNowTick] = useState(0);
   const [commandHistory, setCommandHistory] = useState<CommandHistoryEntry[]>([]);
   const [inAppAlert, setInAppAlert] = useState<InAppAlert | null>(null);
+  const [, setInternalAlertEvents] = useState<ActusInternalAlertEvent[]>([]);
   const [setupHistory, setSetupHistory] = useState<SetupHistoryEntry[]>(() => readLocalStorage(PRODUCT_HISTORY_KEY, [] as SetupHistoryEntry[]));
   const [openPositions, setOpenPositions] = useState<Record<string, OpenPositionRecord>>(() => readLocalStorage(OPEN_POSITIONS_KEY, {} as Record<string, OpenPositionRecord>));
   const [closedPositions, setClosedPositions] = useState<Record<string, ClosedPositionRecord>>(() => readLocalStorage(CLOSED_POSITIONS_KEY, {} as Record<string, ClosedPositionRecord>));
@@ -2819,6 +3166,8 @@ export default function App() {
   const alertTimestampsRef = useRef<Record<string, number>>({});
   const previousLifecycleRef = useRef<Record<string, ActusExecutionState>>({});
   const previousManagementSignalRef = useRef<Record<string, string>>({});
+  const previousInternalAlertStateRef = useRef<Record<string, ActusInternalAlertSnapshot>>({});
+  const emittedInternalAlertSignaturesRef = useRef<Record<string, number>>({});
   const openSetupsRef = useRef<Record<string, OpenSetupRecord>>({});
 
   useEffect(() => {
@@ -3381,7 +3730,7 @@ export default function App() {
     };
   }, [actusModeAsset?.symbol, actusModeAsset?.timeframe, actusModeStreamAsset]);
 
-  const actusModeDisplayAsset = useMemo(
+  const actusModeLiveDisplayAsset = useMemo(
     () =>
       actusModeAsset
         ? {
@@ -3393,14 +3742,14 @@ export default function App() {
         : null,
     [actusModeAsset, actusModeLiveChart.price, actusModeLiveChart.sparkline],
   );
-  const actusModeChartCandles = useMemo(() => {
+  const actusModeBaseChartCandles = useMemo(() => {
     if (hasRenderableActusCandles(actusModeLiveChart.candles)) {
       return actusModeLiveChart.candles;
     }
 
     const fallbackCandles =
-      actusModeDisplayAsset && hasRenderableActusSparkline(actusModeDisplayAsset.sparkline)
-        ? buildSparklineFallbackCandles(actusModeDisplayAsset)
+      actusModeLiveDisplayAsset && hasRenderableActusSparkline(actusModeLiveDisplayAsset.sparkline)
+        ? buildSparklineFallbackCandles(actusModeLiveDisplayAsset)
         : null;
 
     if (fallbackCandles) {
@@ -3412,7 +3761,91 @@ export default function App() {
     }
 
     return null;
-  }, [actusModeDisplayAsset, actusModeLiveChart.candles, actusModeLiveChart.historyResolved, actusModeLiveChart.supported]);
+  }, [actusModeLiveDisplayAsset, actusModeLiveChart.candles, actusModeLiveChart.historyResolved, actusModeLiveChart.supported]);
+
+  const actusReplayAvailable = Boolean(actusModeBaseChartCandles && actusModeBaseChartCandles.length > 1);
+  const actusModeChartCandles = useMemo(() => {
+    if (!actusReplayState.isReplayMode || !actusModeBaseChartCandles?.length) {
+      return actusModeBaseChartCandles;
+    }
+
+    return actusModeBaseChartCandles.slice(0, actusReplayState.replayIndex + 1);
+  }, [actusModeBaseChartCandles, actusReplayState.isReplayMode, actusReplayState.replayIndex]);
+
+  const actusModeDisplayAsset = useMemo(() => {
+    if (!actusModeLiveDisplayAsset) {
+      return null;
+    }
+
+    if (!actusReplayState.isReplayMode || !actusModeChartCandles?.length) {
+      return actusModeLiveDisplayAsset;
+    }
+
+    const replayCandles = actusModeChartCandles;
+    const latestReplayCandle = replayCandles[replayCandles.length - 1] ?? null;
+    const firstReplayOpen = replayCandles[0]?.open ?? null;
+    const replayPrice = latestReplayCandle?.close ?? actusModeLiveDisplayAsset.price;
+    const replayChangePct =
+      typeof replayPrice === "number" && Number.isFinite(replayPrice) && typeof firstReplayOpen === "number" && Number.isFinite(firstReplayOpen) && firstReplayOpen !== 0
+        ? ((replayPrice - firstReplayOpen) / firstReplayOpen) * 100
+        : actusModeLiveDisplayAsset.changePct;
+
+    return {
+      ...actusModeLiveDisplayAsset,
+      price: replayPrice,
+      changePct: replayChangePct,
+      sparkline: replayCandles.slice(-32).map((candle) => candle.close),
+    };
+  }, [actusModeChartCandles, actusModeLiveDisplayAsset, actusReplayState.isReplayMode]);
+  useEffect(() => {
+    setActusReplayState({
+      isReplayMode: false,
+      isPlaying: false,
+      replayIndex: 0,
+      replaySpeed: DEFAULT_REPLAY_SPEED,
+    });
+  }, [actusModeAsset?.symbol, actusModeAsset?.timeframe]);
+
+  useEffect(() => {
+    if (!actusModeBaseChartCandles?.length) {
+      setActusReplayState((current) =>
+        current.isReplayMode || current.isPlaying || current.replayIndex !== 0
+          ? { ...current, isReplayMode: false, isPlaying: false, replayIndex: 0 }
+          : current,
+      );
+      return;
+    }
+
+    const maxIndex = actusModeBaseChartCandles.length - 1;
+    setActusReplayState((current) =>
+      current.replayIndex > maxIndex ? { ...current, replayIndex: maxIndex, isPlaying: false } : current,
+    );
+  }, [actusModeBaseChartCandles]);
+
+  useEffect(() => {
+    if (!actusReplayState.isReplayMode || !actusReplayState.isPlaying || !actusModeBaseChartCandles?.length) {
+      return;
+    }
+
+    const maxIndex = actusModeBaseChartCandles.length - 1;
+    if (actusReplayState.replayIndex >= maxIndex) {
+      setActusReplayState((current) => (current.isPlaying ? { ...current, isPlaying: false } : current));
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setActusReplayState((current) => {
+        const nextIndex = Math.min(current.replayIndex + 1, maxIndex);
+        return {
+          ...current,
+          replayIndex: nextIndex,
+          isPlaying: nextIndex < maxIndex,
+        };
+      });
+    }, actusReplayState.replaySpeed);
+
+    return () => window.clearTimeout(timer);
+  }, [actusModeBaseChartCandles, actusReplayState.isPlaying, actusReplayState.isReplayMode, actusReplayState.replayIndex, actusReplayState.replaySpeed]);
   useEffect(() => {
     const traceKey = actusTraceDepthKey(actusModeAsset?.symbol, actusModeAsset?.timeframe ?? null);
     if (!traceKey) {
@@ -3437,20 +3870,20 @@ export default function App() {
     });
   }, [actusModeAsset?.symbol, actusModeAsset?.timeframe, actusModeChartCandles, actusModeLiveChart.candles, actusModeLiveChart.historyResolved]);
   const actusModePosition = useMemo(
-    () => (actusModeDisplayAsset ? openPositions[setupKey(actusModeDisplayAsset)] ?? null : null),
-    [actusModeDisplayAsset, openPositions],
+    () => (actusReplayState.isReplayMode || !actusModeDisplayAsset ? null : openPositions[setupKey(actusModeDisplayAsset)] ?? null),
+    [actusModeDisplayAsset, actusReplayState.isReplayMode, openPositions],
   );
   useEffect(() => {
     let cancelled = false;
 
-    if (!actusModeDisplayAsset) {
+    if (!actusModeLiveDisplayAsset) {
       setActusModeGammaBase(null);
       return;
     }
 
     setActusModeGammaBase(null);
 
-    void resolveActusGammaOverlay(actusModeDisplayAsset)
+    void resolveActusGammaOverlay(actusModeLiveDisplayAsset)
       .then((overlay) => {
         if (!cancelled) {
           setActusModeGammaBase(overlay);
@@ -3458,7 +3891,7 @@ export default function App() {
       })
       .catch((error) => {
         Sentry.captureException(error, {
-          tags: { scope: "actus-gamma-overlay", symbol: actusModeDisplayAsset.symbol },
+          tags: { scope: "actus-gamma-overlay", symbol: actusModeLiveDisplayAsset.symbol },
         });
         if (!cancelled) {
           setActusModeGammaBase(null);
@@ -3468,19 +3901,19 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [actusModeDisplayAsset?.symbol, actusModeDisplayAsset?.timeframe, actusModeDisplayAsset?.price]);
+  }, [actusModeLiveDisplayAsset?.symbol, actusModeLiveDisplayAsset?.timeframe, actusModeLiveDisplayAsset?.price]);
 
   useEffect(() => {
     let cancelled = false;
 
-    if (!actusModeDisplayAsset) {
+    if (!actusModeLiveDisplayAsset) {
       setActusModeDeltaSignal(null);
       return;
     }
 
     setActusModeDeltaSignal(null);
 
-    void resolveActusDeltaSignal(actusModeDisplayAsset)
+    void resolveActusDeltaSignal(actusModeLiveDisplayAsset)
       .then((signal) => {
         if (!cancelled) {
           setActusModeDeltaSignal(signal);
@@ -3488,7 +3921,7 @@ export default function App() {
       })
       .catch((error) => {
         Sentry.captureException(error, {
-          tags: { scope: "actus-delta-signal", symbol: actusModeDisplayAsset.symbol },
+          tags: { scope: "actus-delta-signal", symbol: actusModeLiveDisplayAsset.symbol },
         });
         if (!cancelled) {
           setActusModeDeltaSignal(null);
@@ -3498,11 +3931,11 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [actusModeDisplayAsset?.symbol, actusModeDisplayAsset?.timeframe, actusModeDisplayAsset?.price]);
+  }, [actusModeLiveDisplayAsset?.symbol, actusModeLiveDisplayAsset?.timeframe, actusModeLiveDisplayAsset?.price]);
 
   const actusModeGammaOverlay = useMemo(
     () =>
-      actusModeDisplayAsset && actusModeGammaBase
+      !actusReplayState.isReplayMode && actusModeDisplayAsset && actusModeGammaBase
         ? withActusGammaSpot(
             actusModeGammaBase,
             typeof actusModeDisplayAsset.price === "number" && Number.isFinite(actusModeDisplayAsset.price)
@@ -3510,11 +3943,20 @@ export default function App() {
               : null,
           )
         : null,
-    [actusModeDisplayAsset, actusModeGammaBase],
+    [actusModeDisplayAsset, actusModeGammaBase, actusReplayState.isReplayMode],
+  );
+  const actusModeEffectiveDeltaSignal = useMemo(
+    () =>
+      actusReplayState.isReplayMode
+        ? actusModeDisplayAsset
+          ? buildReplaySafeDeltaSignal(actusModeDisplayAsset.symbol)
+          : null
+        : actusModeDeltaSignal,
+    [actusModeDeltaSignal, actusModeDisplayAsset, actusReplayState.isReplayMode],
   );
   const actusModeUnifiedPositioning = useMemo(
-    () => (actusModeDisplayAsset ? deriveActusPositioning(actusModeDisplayAsset, actusModeGammaOverlay, actusModeDeltaSignal) : null),
-    [actusModeDeltaSignal, actusModeDisplayAsset, actusModeGammaOverlay],
+    () => (actusModeDisplayAsset ? deriveActusPositioning(actusModeDisplayAsset, actusModeGammaOverlay, actusModeEffectiveDeltaSignal) : null),
+    [actusModeEffectiveDeltaSignal, actusModeDisplayAsset, actusModeGammaOverlay],
   );
   const actusModeChartGammaOverlay = useMemo(
     () =>
@@ -3567,9 +4009,56 @@ export default function App() {
     });
   }, [actusModeAsset?.symbol, actusModeAsset?.timeframe, actusModeDeltaSignal]);
   const actusModeClosedPosition = useMemo(
-    () => (actusModeDisplayAsset ? closedPositions[setupKey(actusModeDisplayAsset)] ?? null : null),
-    [actusModeDisplayAsset, closedPositions],
+    () => (actusReplayState.isReplayMode || !actusModeDisplayAsset ? null : closedPositions[setupKey(actusModeDisplayAsset)] ?? null),
+    [actusModeDisplayAsset, actusReplayState.isReplayMode, closedPositions],
   );
+  useEffect(() => {
+    const nextSnapshots: Record<string, ActusInternalAlertSnapshot> = {};
+    const nextEvents: ActusInternalAlertEvent[] = [];
+    const now = Date.now();
+
+    filteredOpportunities.forEach((item) => {
+      const key = setupKey(item);
+      nextSnapshots[key] = buildInternalAlertSnapshot(item);
+    });
+
+    if (actusModeDisplayAsset) {
+      const actusKey = setupKey(actusModeDisplayAsset);
+      nextSnapshots[actusKey] = buildInternalAlertSnapshot(actusModeDisplayAsset, {
+        positioningType: actusModeUnifiedPositioning?.positioningType ?? null,
+        deltaSignal: actusModeEffectiveDeltaSignal,
+      });
+    }
+
+    Object.entries(nextSnapshots).forEach(([key, snapshot]) => {
+      const previous = previousInternalAlertStateRef.current[key] ?? null;
+      const transitions = buildInternalAlertEvents(previous, snapshot);
+
+      transitions.forEach(({ eventType, signature }) => {
+        const lastEmittedAt = emittedInternalAlertSignaturesRef.current[signature] ?? 0;
+        if (now - lastEmittedAt <= ALERT_THROTTLE_MS) {
+          return;
+        }
+
+        nextEvents.push({
+          id: `${signature}-${now}`,
+          asset: snapshot.symbol,
+          timestamp: now,
+          eventType,
+          snapshot,
+          previousSnapshot: previous,
+        });
+        emittedInternalAlertSignaturesRef.current[signature] = now;
+      });
+    });
+
+    previousInternalAlertStateRef.current = nextSnapshots;
+
+    if (nextEvents.length) {
+      console.info("[ACTUS][INTERNAL ALERTS]", nextEvents);
+      setInternalAlertEvents((current) => [...nextEvents, ...current].slice(0, 40));
+    }
+  }, [filteredOpportunities, actusModeDisplayAsset, actusModeEffectiveDeltaSignal, actusModeUnifiedPositioning]);
 
   const filteredRanked = useMemo(
     () =>
@@ -3690,6 +4179,98 @@ export default function App() {
         ...selected,
         timeframe: selectedTimeframe,
       },
+    });
+  };
+
+  const toggleActusReplayMode = () => {
+    if (!actusReplayAvailable || !actusModeBaseChartCandles?.length) {
+      return;
+    }
+
+    setActusReplayState((current) => {
+      if (current.isReplayMode) {
+        return {
+          ...current,
+          isReplayMode: false,
+          isPlaying: false,
+        };
+      }
+
+      return {
+        ...current,
+        isReplayMode: true,
+        isPlaying: false,
+        replayIndex: Math.min(Math.max(23, 0), actusModeBaseChartCandles.length - 1),
+      };
+    });
+  };
+
+  const toggleActusReplayPlayback = () => {
+    if (!actusReplayAvailable || !actusModeBaseChartCandles?.length) {
+      return;
+    }
+
+    setActusReplayState((current) => {
+      const maxIndex = actusModeBaseChartCandles.length - 1;
+      if (!current.isReplayMode) {
+        return {
+          ...current,
+          isReplayMode: true,
+          isPlaying: true,
+          replayIndex: Math.min(Math.max(23, 0), maxIndex),
+        };
+      }
+
+      if (current.replayIndex >= maxIndex && !current.isPlaying) {
+        return {
+          ...current,
+          isPlaying: true,
+          replayIndex: Math.min(Math.max(23, 0), maxIndex),
+        };
+      }
+
+      return {
+        ...current,
+        isPlaying: !current.isPlaying,
+      };
+    });
+  };
+
+  const stepActusReplayBack = () => {
+    if (!actusReplayAvailable || !actusModeBaseChartCandles?.length) {
+      return;
+    }
+
+    setActusReplayState((current) => ({
+      ...current,
+      isReplayMode: true,
+      isPlaying: false,
+      replayIndex: Math.max(current.replayIndex - 1, 0),
+    }));
+  };
+
+  const stepActusReplayForward = () => {
+    if (!actusReplayAvailable || !actusModeBaseChartCandles?.length) {
+      return;
+    }
+
+    const maxIndex = actusModeBaseChartCandles.length - 1;
+    setActusReplayState((current) => ({
+      ...current,
+      isReplayMode: true,
+      isPlaying: false,
+      replayIndex: Math.min(current.replayIndex + 1, maxIndex),
+    }));
+  };
+
+  const cycleActusReplaySpeed = () => {
+    setActusReplayState((current) => {
+      const currentIndex = REPLAY_SPEEDS.indexOf(current.replaySpeed as (typeof REPLAY_SPEEDS)[number]);
+      const nextSpeed = REPLAY_SPEEDS[(currentIndex + 1 + REPLAY_SPEEDS.length) % REPLAY_SPEEDS.length];
+      return {
+        ...current,
+        replaySpeed: nextSpeed,
+      };
     });
   };
 
@@ -3929,15 +4510,21 @@ export default function App() {
               actusModeDisplayAsset,
               actusModeChartCandles,
               actusModeGammaOverlay,
-              actusModeDeltaSignal,
+              actusModeEffectiveDeltaSignal,
+              actusReplayState,
               nowTick,
               () => setActusModeSelection(null),
+              toggleActusReplayMode,
+              toggleActusReplayPlayback,
+              stepActusReplayBack,
+              stepActusReplayForward,
+              cycleActusReplaySpeed,
               actusModePosition,
-                actusModeClosedPosition,
-                fillPriceDrafts[setupKey(actusModeDisplayAsset)] ?? "",
-                updateFillPriceDraft,
-                markOrderFilled,
-                closePosition,
+              actusModeClosedPosition,
+              fillPriceDrafts[setupKey(actusModeDisplayAsset)] ?? "",
+              updateFillPriceDraft,
+              markOrderFilled,
+              closePosition,
               )
             : null}
           {!showFirstLoadSkeleton && !actusModeDisplayAsset && hero ? heroSignalCard(hero, nowTick, openActusMode) : null}
