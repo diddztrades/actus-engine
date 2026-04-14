@@ -79,6 +79,12 @@ type ActusReplayState = {
   replaySpeed: number;
 };
 
+type ActusReplayHistoryState = {
+  loading: boolean;
+  candles: NormalizedFuturesCandle[] | null;
+  resolved: boolean;
+};
+
 type ProductPrefs = {
   favorites: string[];
   alertEnabledByAsset: Record<string, boolean>;
@@ -479,6 +485,52 @@ function buildInternalAlertEvents(
   return events;
 }
 
+function internalAlertEventLabel(eventType: ActusInternalAlertEventType) {
+  if (eventType === "bias-change") return "Bias Shift";
+  if (eventType === "confidence-threshold") return "Confidence Shift";
+  if (eventType === "condition-change") return "Condition Shift";
+  if (eventType === "positioning-change") return "Positioning Shift";
+  return "Delta Directional";
+}
+
+function internalAlertEventTone(eventType: ActusInternalAlertEventType) {
+  if (eventType === "delta-directional") return tone("execute");
+  if (eventType === "positioning-change") return { text: "#67b7ff", bg: "rgba(103,183,255,0.12)", border: "rgba(103,183,255,0.28)" };
+  if (eventType === "confidence-threshold") return tone("wait");
+  return tone("avoid");
+}
+
+function internalAlertRecencyLabel(timestamp: number, now: number) {
+  const elapsedMinutes = Math.max(0, Math.floor((now - timestamp) / 60000));
+  if (elapsedMinutes < 1) return "now";
+  if (elapsedMinutes < 60) return `${elapsedMinutes}m ago`;
+  const hours = Math.floor(elapsedMinutes / 60);
+  const minutes = elapsedMinutes % 60;
+  return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+}
+
+function internalAlertSummary(event: ActusInternalAlertEvent) {
+  const previous = event.previousSnapshot;
+  const next = event.snapshot;
+
+  if (event.eventType === "bias-change" && previous) {
+    return `${previous.bias} to ${next.bias}`;
+  }
+  if (event.eventType === "confidence-threshold" && previous) {
+    return `${previous.confidenceBand} to ${next.confidenceBand}`;
+  }
+  if (event.eventType === "condition-change" && previous) {
+    return `${previous.condition.replace("_", " ")} to ${next.condition.replace("_", " ")}`;
+  }
+  if (event.eventType === "positioning-change" && previous) {
+    return `${previous.positioningType ?? "NONE"} to ${next.positioningType ?? "NONE"}`;
+  }
+  if (event.eventType === "delta-directional") {
+    return next.deltaBias ? `${next.deltaBias} flow confirmed` : "Directional flow confirmed";
+  }
+  return next.symbol;
+}
+
 function replayOutcomeTone(outcome: SetupOutcome) {
   if (outcome === "completed") {
     return tone("execute");
@@ -814,6 +866,13 @@ function actusTargetBars(timeframe: TimeframeFilter) {
   if (timeframe === "5m") return 120;
   if (timeframe === "15m") return 100;
   return 80;
+}
+
+function actusReplayHistoryLimit(timeframe: TimeframeFilter) {
+  if (timeframe === "1m") return 720;
+  if (timeframe === "5m") return 480;
+  if (timeframe === "15m") return 320;
+  return 180;
 }
 
 function actusTraceDepthKey(symbol: string | null | undefined, timeframe: TimeframeFilter | null | undefined) {
@@ -3143,6 +3202,11 @@ export default function App() {
     replayIndex: 0,
     replaySpeed: DEFAULT_REPLAY_SPEED,
   });
+  const [actusReplayHistory, setActusReplayHistory] = useState<ActusReplayHistoryState>({
+    loading: false,
+    candles: null,
+    resolved: false,
+  });
   const [actusModeLiveChart, setActusModeLiveChart] = useState<ActusModeLiveChartState>({
     supported: false,
     connected: false,
@@ -3157,7 +3221,7 @@ export default function App() {
   const [nowTick, setNowTick] = useState(0);
   const [commandHistory, setCommandHistory] = useState<CommandHistoryEntry[]>([]);
   const [inAppAlert, setInAppAlert] = useState<InAppAlert | null>(null);
-  const [, setInternalAlertEvents] = useState<ActusInternalAlertEvent[]>([]);
+  const [internalAlertEvents, setInternalAlertEvents] = useState<ActusInternalAlertEvent[]>([]);
   const [setupHistory, setSetupHistory] = useState<SetupHistoryEntry[]>(() => readLocalStorage(PRODUCT_HISTORY_KEY, [] as SetupHistoryEntry[]));
   const [openPositions, setOpenPositions] = useState<Record<string, OpenPositionRecord>>(() => readLocalStorage(OPEN_POSITIONS_KEY, {} as Record<string, OpenPositionRecord>));
   const [closedPositions, setClosedPositions] = useState<Record<string, ClosedPositionRecord>>(() => readLocalStorage(CLOSED_POSITIONS_KEY, {} as Record<string, ClosedPositionRecord>));
@@ -3764,13 +3828,19 @@ export default function App() {
   }, [actusModeLiveDisplayAsset, actusModeLiveChart.candles, actusModeLiveChart.historyResolved, actusModeLiveChart.supported]);
 
   const actusReplayAvailable = Boolean(actusModeBaseChartCandles && actusModeBaseChartCandles.length > 1);
+  const actusReplaySourceCandles = useMemo(() => {
+    if (actusReplayState.isReplayMode && actusReplayHistory.candles?.length) {
+      return actusReplayHistory.candles;
+    }
+    return actusModeBaseChartCandles;
+  }, [actusModeBaseChartCandles, actusReplayHistory.candles, actusReplayState.isReplayMode]);
   const actusModeChartCandles = useMemo(() => {
-    if (!actusReplayState.isReplayMode || !actusModeBaseChartCandles?.length) {
+    if (!actusReplayState.isReplayMode || !actusReplaySourceCandles?.length) {
       return actusModeBaseChartCandles;
     }
 
-    return actusModeBaseChartCandles.slice(0, actusReplayState.replayIndex + 1);
-  }, [actusModeBaseChartCandles, actusReplayState.isReplayMode, actusReplayState.replayIndex]);
+    return actusReplaySourceCandles.slice(0, actusReplayState.replayIndex + 1);
+  }, [actusModeBaseChartCandles, actusReplaySourceCandles, actusReplayState.isReplayMode, actusReplayState.replayIndex]);
 
   const actusModeDisplayAsset = useMemo(() => {
     if (!actusModeLiveDisplayAsset) {
@@ -3804,10 +3874,15 @@ export default function App() {
       replayIndex: 0,
       replaySpeed: DEFAULT_REPLAY_SPEED,
     });
+    setActusReplayHistory({
+      loading: false,
+      candles: null,
+      resolved: false,
+    });
   }, [actusModeAsset?.symbol, actusModeAsset?.timeframe]);
 
   useEffect(() => {
-    if (!actusModeBaseChartCandles?.length) {
+    if (!actusReplaySourceCandles?.length) {
       setActusReplayState((current) =>
         current.isReplayMode || current.isPlaying || current.replayIndex !== 0
           ? { ...current, isReplayMode: false, isPlaying: false, replayIndex: 0 }
@@ -3816,18 +3891,82 @@ export default function App() {
       return;
     }
 
-    const maxIndex = actusModeBaseChartCandles.length - 1;
+    const maxIndex = actusReplaySourceCandles.length - 1;
     setActusReplayState((current) =>
       current.replayIndex > maxIndex ? { ...current, replayIndex: maxIndex, isPlaying: false } : current,
     );
-  }, [actusModeBaseChartCandles]);
+  }, [actusReplaySourceCandles]);
 
   useEffect(() => {
-    if (!actusReplayState.isReplayMode || !actusReplayState.isPlaying || !actusModeBaseChartCandles?.length) {
+    let cancelled = false;
+
+    if (!actusReplayState.isReplayMode || !actusModeStreamAsset || !actusModeAsset) {
       return;
     }
 
-    const maxIndex = actusModeBaseChartCandles.length - 1;
+    if (actusReplayHistory.resolved || actusReplayHistory.loading) {
+      return;
+    }
+
+    setActusReplayHistory({
+      loading: true,
+      candles: actusModeBaseChartCandles ?? null,
+      resolved: false,
+    });
+
+    void ensureActusCandleDepth({
+      asset: actusModeStreamAsset,
+      displaySymbol: actusModeAsset.symbol,
+      timeframe: actusModeAsset.timeframe,
+      historyLimit: actusReplayHistoryLimit(actusModeAsset.timeframe),
+    })
+      .then((candles) => {
+        if (cancelled) {
+          return;
+        }
+
+        setActusReplayHistory({
+          loading: false,
+          candles: candles.length ? candles : actusModeBaseChartCandles ?? null,
+          resolved: true,
+        });
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        Sentry.captureException(error, {
+          tags: {
+            scope: "actus-replay-history",
+            symbol: actusModeAsset.symbol,
+            timeframe: actusModeAsset.timeframe,
+          },
+        });
+        setActusReplayHistory({
+          loading: false,
+          candles: actusModeBaseChartCandles ?? null,
+          resolved: true,
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    actusModeAsset,
+    actusModeBaseChartCandles,
+    actusModeStreamAsset,
+    actusReplayHistory.loading,
+    actusReplayHistory.resolved,
+    actusReplayState.isReplayMode,
+  ]);
+
+  useEffect(() => {
+    if (!actusReplayState.isReplayMode || !actusReplayState.isPlaying || !actusReplaySourceCandles?.length) {
+      return;
+    }
+
+    const maxIndex = actusReplaySourceCandles.length - 1;
     if (actusReplayState.replayIndex >= maxIndex) {
       setActusReplayState((current) => (current.isPlaying ? { ...current, isPlaying: false } : current));
       return;
@@ -3845,7 +3984,7 @@ export default function App() {
     }, actusReplayState.replaySpeed);
 
     return () => window.clearTimeout(timer);
-  }, [actusModeBaseChartCandles, actusReplayState.isPlaying, actusReplayState.isReplayMode, actusReplayState.replayIndex, actusReplayState.replaySpeed]);
+  }, [actusReplaySourceCandles, actusReplayState.isPlaying, actusReplayState.isReplayMode, actusReplayState.replayIndex, actusReplayState.replaySpeed]);
   useEffect(() => {
     const traceKey = actusTraceDepthKey(actusModeAsset?.symbol, actusModeAsset?.timeframe ?? null);
     if (!traceKey) {
@@ -4196,11 +4335,13 @@ export default function App() {
         };
       }
 
+      const seedCandles = actusReplayHistory.candles?.length ? actusReplayHistory.candles : actusModeBaseChartCandles;
+      const maxIndex = Math.max((seedCandles?.length ?? 1) - 1, 0);
       return {
         ...current,
         isReplayMode: true,
         isPlaying: false,
-        replayIndex: Math.min(Math.max(23, 0), actusModeBaseChartCandles.length - 1),
+        replayIndex: Math.min(Math.max(23, 0), maxIndex),
       };
     });
   };
@@ -4211,7 +4352,8 @@ export default function App() {
     }
 
     setActusReplayState((current) => {
-      const maxIndex = actusModeBaseChartCandles.length - 1;
+      const seedCandles = actusReplayHistory.candles?.length ? actusReplayHistory.candles : actusModeBaseChartCandles;
+      const maxIndex = Math.max((seedCandles?.length ?? 1) - 1, 0);
       if (!current.isReplayMode) {
         return {
           ...current,
@@ -4850,9 +4992,9 @@ export default function App() {
               </section>
               ) : null}
 
-              <section style={{ background: "linear-gradient(145deg, rgba(10,17,31,0.98), rgba(7,12,22,0.96))", border: "1px solid rgba(132,151,186,0.16)", borderRadius: 26, padding: 18, boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)" }}>
-                <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Alert Center</div>
-                <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
+                <section style={{ background: "linear-gradient(145deg, rgba(10,17,31,0.98), rgba(7,12,22,0.96))", border: "1px solid rgba(132,151,186,0.16)", borderRadius: 26, padding: 18, boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)" }}>
+                  <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Alert Center</div>
+                  <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
                   {inAppAlert ? (
                     <div style={{ padding: 14, borderRadius: 16, background: "rgba(255,255,255,0.02)", border: `1px solid ${tone(inAppAlert.tone === "active" ? "execute" : inAppAlert.tone === "ready" ? "wait" : "avoid").border}` }}>
                       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
@@ -4861,6 +5003,52 @@ export default function App() {
                       </div>
                       <div style={{ marginTop: 8, fontSize: 14, fontWeight: 700, color: "#f4f7fb" }}>{inAppAlert.title}</div>
                       <div style={{ marginTop: 6, fontSize: 13, color: "#d7e1f4", lineHeight: 1.5 }}>{inAppAlert.body}</div>
+                    </div>
+                  ) : null}
+                  {internalAlertEvents.length ? (
+                    <div
+                      style={{
+                        padding: 14,
+                        borderRadius: 16,
+                        background: "rgba(255,255,255,0.018)",
+                        border: "1px solid rgba(142,160,191,0.1)",
+                        display: "grid",
+                        gap: 10,
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                        <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.08em", textTransform: "uppercase" }}>ACTUS Transitions</div>
+                        {badge(`${Math.min(internalAlertEvents.length, 4)} recent`, "#d7e1f4", "rgba(255,255,255,0.03)", "rgba(142,160,191,0.14)")}
+                      </div>
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {internalAlertEvents.slice(0, 4).map((event) => {
+                          const colors = internalAlertEventTone(event.eventType);
+                          return (
+                            <div
+                              key={event.id}
+                              style={{
+                                padding: "10px 12px",
+                                borderRadius: 14,
+                                background: "rgba(255,255,255,0.018)",
+                                border: `1px solid ${colors.border}`,
+                                display: "grid",
+                                gap: 5,
+                              }}
+                            >
+                              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                  <div style={{ fontSize: 12, color: "#f4f7fb", fontWeight: 700 }}>{event.asset}</div>
+                                  {badge(internalAlertEventLabel(event.eventType), colors.text, colors.bg, colors.border)}
+                                </div>
+                                <div style={{ fontSize: 11, color: "#8ea0bf" }}>{internalAlertRecencyLabel(event.timestamp, Date.now())}</div>
+                              </div>
+                              <div style={{ fontSize: 12, color: "#d7e1f4", lineHeight: 1.45 }}>
+                                {internalAlertSummary(event)}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
                   ) : null}
                   {snapshot.alerts.length ? (
@@ -4874,7 +5062,7 @@ export default function App() {
                         <div style={{ marginTop: 6, fontSize: 13, color: "#d7e1f4", lineHeight: 1.5 }}>{alert.body}</div>
                       </div>
                     ))
-                  ) : !inAppAlert ? (
+                  ) : !inAppAlert && !internalAlertEvents.length ? (
                     <div style={{ fontSize: 14, color: "#9aabc8", lineHeight: 1.55 }}>No active alerts right now. The system is waiting for a clearer condition shift.</div>
                   ) : null}
                 </div>
