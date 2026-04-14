@@ -14,6 +14,7 @@ import {
   closedCandleBoundaryMs,
   minimumActusHistoryCandles,
 } from "./lib/actusChartConfig";
+import { resolveActusDeltaSignal } from "./lib/actusDelta";
 import { resolveActusGammaOverlay, withActusGammaSpot } from "./lib/actusGammaOverlay";
 import { deriveActusPositioning, type ActusPositioning } from "./lib/actusDecisionEngine";
 import {
@@ -25,6 +26,7 @@ import {
   type ActusExecutionState,
 } from "./lib/actusExecutionState";
 import type { TimeframeFilter } from "./types/chart";
+import type { DeltaSignal } from "./types/delta";
 import type { GammaOverlay } from "./types/chart";
 import type { NormalizedFuturesCandle } from "./types/market";
 import { Sentry } from "./sentry";
@@ -686,17 +688,59 @@ function sortActusCandles(candles: NormalizedFuturesCandle[]) {
     .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
 }
 
+function supportsActusIntradayDensification(asset: DatabentoCoreAsset, timeframe: TimeframeFilter) {
+  return (asset === "NQ" || asset === "GC" || asset === "CL") && (timeframe === "1m" || timeframe === "5m" || timeframe === "15m");
+}
+
+function actusMaxFlatFillGapBuckets(timeframe: TimeframeFilter) {
+  if (timeframe === "1m") return 3;
+  if (timeframe === "5m") return 2;
+  if (timeframe === "15m") return 1;
+  return 0;
+}
+
+function trimActusIntradayWindow(
+  candles: NormalizedFuturesCandle[],
+  timeframe: TimeframeFilter,
+  targetBars: number,
+) {
+  if (!candles.length) {
+    return candles;
+  }
+
+  const sorted = sortActusCandles(candles);
+  const durationMs = actusTimeframeDurationMs(timeframe);
+  const maxGapBuckets = actusMaxFlatFillGapBuckets(timeframe);
+  let activeStartIndex = Math.max(0, sorted.length - targetBars);
+
+  for (let index = sorted.length - 1; index > 0; index -= 1) {
+    const currentMs = Date.parse(sorted[index].timestamp);
+    const previousMs = Date.parse(sorted[index - 1].timestamp);
+    if (!Number.isFinite(currentMs) || !Number.isFinite(previousMs)) {
+      continue;
+    }
+
+    const missingBuckets = Math.round((currentMs - previousMs) / durationMs) - 1;
+    if (missingBuckets > maxGapBuckets) {
+      activeStartIndex = index;
+      break;
+    }
+  }
+
+  return sorted.slice(activeStartIndex);
+}
+
 function densifySparseActusCandles(
   candles: NormalizedFuturesCandle[],
   asset: DatabentoCoreAsset,
   timeframe: TimeframeFilter,
   targetBars: number,
 ) {
-  if (asset !== "GC" || timeframe !== "1m" || !candles.length) {
+  if (!supportsActusIntradayDensification(asset, timeframe) || !candles.length) {
     return candles;
   }
 
-  const sorted = sortActusCandles(candles);
+  const sorted = trimActusIntradayWindow(candles, timeframe, targetBars);
   const durationMs = actusTimeframeDurationMs(timeframe);
   const lastTimestampMs = Date.parse(sorted[sorted.length - 1].timestamp);
   if (!Number.isFinite(lastTimestampMs)) {
@@ -705,12 +749,22 @@ function densifySparseActusCandles(
 
   const firstWindowTimestampMs = lastTimestampMs - durationMs * (targetBars - 1);
   const byTimestamp = new Map(sorted.map((candle) => [Date.parse(candle.timestamp), candle] as const));
-  const seed = [...sorted].reverse().find((candle) => Date.parse(candle.timestamp) <= firstWindowTimestampMs) ?? sorted[0];
+  const maxGapBuckets = actusMaxFlatFillGapBuckets(timeframe);
+  const firstActualInWindow =
+    sorted.find((candle) => {
+      const timestampMs = Date.parse(candle.timestamp);
+      return Number.isFinite(timestampMs) && timestampMs >= firstWindowTimestampMs;
+    }) ?? sorted[0];
+  const firstActualTimestampMs = Date.parse(firstActualInWindow.timestamp);
 
-  let carry = seed.close;
-  const densified: NormalizedFuturesCandle[] = [];
+  if (!Number.isFinite(firstActualTimestampMs)) {
+    return sorted;
+  }
 
-  for (let timestampMs = firstWindowTimestampMs; timestampMs <= lastTimestampMs; timestampMs += durationMs) {
+  let carry = firstActualInWindow.close;
+  const densified: NormalizedFuturesCandle[] = [firstActualInWindow];
+
+  for (let timestampMs = firstActualTimestampMs + durationMs; timestampMs <= lastTimestampMs; timestampMs += durationMs) {
     const actual = byTimestamp.get(timestampMs);
     if (actual) {
       carry = actual.close;
@@ -718,10 +772,27 @@ function densifySparseActusCandles(
       continue;
     }
 
+    let nextActualTimestampMs: number | null = null;
+    for (let probe = timestampMs + durationMs; probe <= lastTimestampMs; probe += durationMs) {
+      if (byTimestamp.has(probe)) {
+        nextActualTimestampMs = probe;
+        break;
+      }
+    }
+
+    if (nextActualTimestampMs === null) {
+      break;
+    }
+
+    const gapBuckets = Math.round((nextActualTimestampMs - timestampMs) / durationMs);
+    if (gapBuckets > maxGapBuckets) {
+      continue;
+    }
+
     densified.push({
-      asset: seed.asset,
-      symbol: seed.symbol,
-      timeframe: seed.timeframe,
+      asset: firstActualInWindow.asset,
+      symbol: firstActualInWindow.symbol,
+      timeframe: firstActualInWindow.timeframe,
       timestamp: new Date(timestampMs).toISOString(),
       open: carry,
       high: carry,
@@ -744,12 +815,18 @@ function mergeActusLiveCandleSeries(
   const base = sortActusCandles((currentCandles ?? []).filter((candle) => candle.timestamp !== incoming.timestamp));
   const lastExisting = base[base.length - 1] ?? null;
 
-  if (asset === "GC" && timeframe === "1m" && lastExisting) {
+  if (supportsActusIntradayDensification(asset, timeframe) && lastExisting) {
     const durationMs = actusTimeframeDurationMs(timeframe);
     const lastMs = Date.parse(lastExisting.timestamp);
     const nextMs = Date.parse(incoming.timestamp);
+    const maxGapBuckets = actusMaxFlatFillGapBuckets(timeframe);
 
-    if (Number.isFinite(lastMs) && Number.isFinite(nextMs) && nextMs - lastMs > durationMs) {
+    if (
+      Number.isFinite(lastMs) &&
+      Number.isFinite(nextMs) &&
+      nextMs - lastMs > durationMs &&
+      (nextMs - lastMs) / durationMs - 1 <= maxGapBuckets
+    ) {
       let carry = lastExisting.close;
       for (let ts = lastMs + durationMs; ts < nextMs; ts += durationMs) {
         base.push({
@@ -779,7 +856,7 @@ function summarizeActusCandleSemantics(candles: NormalizedFuturesCandle[]) {
       lastTimestamp: null,
       spanHours: 0,
       averageBarsPerHour: 0,
-      missingMinuteBuckets: 0,
+      gapCount: 0,
       maxGapMinutes: 0,
     };
   }
@@ -807,7 +884,7 @@ function summarizeActusCandleSemantics(candles: NormalizedFuturesCandle[]) {
     lastTimestamp: sorted[sorted.length - 1].timestamp,
     spanHours,
     averageBarsPerHour: spanHours > 0 ? sorted.length / spanHours : sorted.length,
-    missingMinuteBuckets,
+    gapCount: missingMinuteBuckets,
     maxGapMinutes,
   };
 }
@@ -876,11 +953,13 @@ async function ensureActusCandleDepth(args: {
     });
   }
 
-  if (asset === "GC" && timeframe === "1m") {
-    console.info("[ACTUS][XAU 1m][SEMANTICS]", {
-      raw: summarizeActusCandleSemantics(finalCandles),
-      densified: summarizeActusCandleSemantics(semanticCandles),
-      sourceProvidesOnlyTradedIntervals: summarizeActusCandleSemantics(finalCandles).missingMinuteBuckets > 0,
+  if (traceKey && timeframe === "1m") {
+    const rawSemantics = summarizeActusCandleSemantics(finalCandles);
+    const densifiedSemantics = summarizeActusCandleSemantics(semanticCandles);
+    console.info(`[ACTUS][${traceKey}][SEMANTICS]`, {
+      raw: rawSemantics,
+      densified: densifiedSemantics,
+      sourceProvidesOnlyTradedIntervals: rawSemantics.gapCount > 0,
     });
   }
 
@@ -1063,30 +1142,119 @@ function positioningTypeTone(type: ActusPositioning["positioningType"]) {
   return "#9fb0cb";
 }
 
+function deltaAvailabilityTone(signal: DeltaSignal | null) {
+  if (signal?.deltaAvailability === "DIRECTIONAL") {
+    return {
+      label: "Delta: Directional",
+      color: "#d7ffea",
+      background: "rgba(69,255,181,0.12)",
+      border: "rgba(69,255,181,0.28)",
+    };
+  }
+  if (signal?.deltaAvailability === "SOURCE_ONLY") {
+    return {
+      label: "Delta: Source Only",
+      color: "#cfe0ff",
+      background: "rgba(103,183,255,0.11)",
+      border: "rgba(103,183,255,0.24)",
+    };
+  }
+  if (signal?.deltaAvailability === "UNSUPPORTED") {
+    return {
+      label: "Delta: Unsupported",
+      color: "#b9c6de",
+      background: "rgba(132,151,186,0.08)",
+      border: "rgba(132,151,186,0.18)",
+    };
+  }
+  return {
+    label: "Delta: Unavailable",
+    color: "#d8c4cd",
+    background: "rgba(255,111,145,0.08)",
+    border: "rgba(255,111,145,0.16)",
+  };
+}
+
+function deltaStrengthTone(signal: DeltaSignal | null) {
+  const strength = signal?.strength ?? 0;
+  if (signal?.deltaAvailability === "DIRECTIONAL" && strength >= 0.2) return "#3ef0a6";
+  if (signal?.deltaAvailability === "DIRECTIONAL" && strength >= 0.12) return "#67b7ff";
+  if (signal?.deltaAvailability === "SOURCE_ONLY") return "#9fc4ff";
+  return "#c8d5ee";
+}
+
+function deltaStrengthLabel(signal: DeltaSignal | null) {
+  if (!signal) return "Pending";
+  if (signal.deltaAvailability === "UNSUPPORTED") return "Not tracked";
+  if (signal.deltaAvailability === "UNAVAILABLE") return "No read";
+  if (signal.deltaAvailability === "SOURCE_ONLY") return "Source active";
+  return `${Math.round((signal.strength ?? 0) * 100)}%`;
+}
+
+function deltaSummary(signal: DeltaSignal | null) {
+  if (!signal) return "Waiting for delta source.";
+  if (signal.deltaAvailability === "DIRECTIONAL") {
+    return "Real directional delta is available for this asset.";
+  }
+  if (signal.deltaAvailability === "SOURCE_ONLY") {
+    return "Real source flow is active, but no directional delta read is justified.";
+  }
+  if (signal.deltaAvailability === "UNSUPPORTED") {
+    return "Delta is not supported for this asset yet.";
+  }
+  return "No usable delta source is available right now.";
+}
+
 function positioningAvailabilityPill(positioning: ActusPositioning | null) {
   if (positioning?.positioningType === "REAL_GAMMA") {
     return {
       label: "Positioning: Active",
-      color: "#9ecdb6",
-      background: "rgba(69,255,181,0.08)",
-      border: "rgba(69,255,181,0.22)",
+      color: "#d7ffea",
+      background: "rgba(69,255,181,0.12)",
+      border: "rgba(69,255,181,0.3)",
     };
   }
 
    if (positioning?.positioningType === "POSITIONING_PROXY") {
     return {
       label: "Positioning: Proxy",
-      color: "#9ec3ff",
-      background: "rgba(103,183,255,0.08)",
-      border: "rgba(103,183,255,0.18)",
+      color: "#c8dcff",
+      background: "rgba(103,183,255,0.09)",
+      border: "rgba(103,183,255,0.22)",
     };
   }
 
   return {
     label: "Positioning: Unavailable",
-    color: "#9fb0cb",
-    background: "rgba(255,255,255,0.03)",
-    border: "rgba(142,160,191,0.14)",
+    color: "#b8c7df",
+    background: "rgba(255,255,255,0.035)",
+    border: "rgba(142,160,191,0.16)",
+  };
+}
+
+function buildActusChartGammaOverlay(
+  item: ActusOpportunityOutput,
+  positioning: ActusPositioning | null,
+  gammaOverlay: GammaOverlay | null,
+): GammaOverlay | null {
+  if (!positioning || positioning.positioningType !== "REAL_GAMMA" || !positioning.gammaLevelsAvailable) {
+    return null;
+  }
+
+  const upper = positioning.levels?.upper ?? gammaOverlay?.callWall ?? null;
+  const lower = positioning.levels?.lower ?? gammaOverlay?.putWall ?? null;
+  const anchor = positioning.levels?.anchor ?? gammaOverlay?.anchor ?? gammaOverlay?.gammaFlip ?? null;
+  const spotReference =
+    gammaOverlay?.spotReference ??
+    (typeof item.price === "number" && Number.isFinite(item.price) ? item.price : null);
+
+  return {
+    ...gammaOverlay,
+    callWall: upper,
+    putWall: lower,
+    anchor,
+    gammaFlip: positioning.gammaDirectionalAvailable ? gammaOverlay?.gammaFlip ?? null : null,
+    spotReference,
   };
 }
 
@@ -1095,15 +1263,35 @@ function decisionPanelField(label: string, value: string, tone = "#f4f7fb") {
     <div
       style={{
         display: "grid",
-        gap: 4,
-        padding: "10px 12px",
+        gap: 5,
+        padding: "11px 12px 10px",
         borderRadius: 12,
-        background: "rgba(255,255,255,0.016)",
+        background: "linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.012))",
+        border: "1px solid rgba(142,160,191,0.12)",
+        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.025)",
+      }}
+    >
+      <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.08em", textTransform: "uppercase" }}>{label}</div>
+      <div style={{ fontSize: 14, fontWeight: 750, color: tone, letterSpacing: "0.01em", lineHeight: 1.2 }}>{value}</div>
+    </div>
+  );
+}
+
+function deltaPanelField(label: string, value: string, tone = "#f4f7fb", detail?: string) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gap: 4,
+        padding: "9px 11px 8px",
+        borderRadius: 11,
+        background: "linear-gradient(180deg, rgba(255,255,255,0.018), rgba(255,255,255,0.01))",
         border: "1px solid rgba(142,160,191,0.1)",
       }}
     >
       <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.08em", textTransform: "uppercase" }}>{label}</div>
-      <div style={{ fontSize: 13, fontWeight: 700, color: tone, letterSpacing: "0.02em" }}>{value}</div>
+      <div style={{ fontSize: 13, fontWeight: 750, color: tone, letterSpacing: "0.01em", lineHeight: 1.15 }}>{value}</div>
+      {detail ? <div style={{ fontSize: 11, color: "#8ea0bf", lineHeight: 1.3 }}>{detail}</div> : null}
     </div>
   );
 }
@@ -1964,6 +2152,7 @@ function actusModePanel(
   item: ActusOpportunityOutput,
   chartCandles: NormalizedFuturesCandle[] | null,
   gammaOverlay: GammaOverlay | null,
+  deltaSignal: DeltaSignal | null,
   nowTick: number,
   onExit: () => void,
   position: OpenPositionRecord | null,
@@ -2053,9 +2242,11 @@ function actusModePanel(
   const positioningLines = item.positioningContext
     ? [item.positioningContext.expansionRisk, item.positioningContext.dealerPressureShift].filter(Boolean)
     : [];
-  const unifiedPositioning = deriveActusPositioning(item, gammaOverlay);
+  const unifiedPositioning = deriveActusPositioning(item, gammaOverlay, deltaSignal);
+  const chartGammaOverlay = buildActusChartGammaOverlay(item, unifiedPositioning, gammaOverlay);
   const positioningPill = positioningAvailabilityPill(unifiedPositioning);
   const decisionDrivers = unifiedPositioning?.drivers.slice(0, 2) ?? [];
+  const deltaTone = deltaAvailabilityTone(deltaSignal);
   const tradeDelta = position
     ? {
         delta: position.side === "short" ? position.filledPrice - item.price : item.price - position.filledPrice,
@@ -2105,15 +2296,43 @@ function actusModePanel(
           >
             {displayStatus}
           </div>
-          {badge(positioningPill.label, positioningPill.color, positioningPill.background, positioningPill.border)}
+          <div
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "7px 12px",
+              borderRadius: 999,
+              color: positioningPill.color,
+              background: positioningPill.background,
+              border: `1px solid ${positioningPill.border}`,
+              fontSize: 11,
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+              fontWeight: 800,
+              boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 18px ${positioningPill.background}`,
+            }}
+          >
+            <span
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: 999,
+                background: positioningPill.color,
+                boxShadow: `0 0 10px ${positioningPill.color}`,
+                opacity: positioningPill.label.endsWith("Unavailable") ? 0.75 : 1,
+              }}
+            />
+            <span>{positioningPill.label}</span>
+          </div>
           {position ? ghostButton("Position Closed", () => onClosePosition(item), "#ff9d66") : null}
           {ghostButton("Back To Board", onExit, "#d7e1f4")}
         </div>
       </div>
 
       <div style={{ display: "grid", gap: 14 }}>
-        <div style={{ padding: "2px 2px 1px", background: "linear-gradient(180deg, rgba(8,12,22,0.62), rgba(4,7,14,0.8))", borderRadius: 10, border: "1px solid rgba(132,151,186,0.04)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 4, flexWrap: "wrap", padding: "0 4px" }}>
+        <div style={{ padding: "3px 3px 2px", background: "radial-gradient(circle at top right, rgba(98,196,255,0.06), transparent 28%), linear-gradient(180deg, rgba(8,12,22,0.7), rgba(4,7,14,0.88))", borderRadius: 12, border: "1px solid rgba(132,151,186,0.08)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.02)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 6, flexWrap: "wrap", padding: "0 6px" }}>
             <div style={{ fontSize: 13, fontWeight: 600, color: "#f4f7fb" }}>
               {item.symbol}
               <span style={{ marginLeft: 8, fontFamily: '"Courier New", monospace', color: "#d7e1f4" }}>{item.price.toLocaleString()}</span>
@@ -2124,7 +2343,7 @@ function actusModePanel(
             </div>
             <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.08em", textTransform: "uppercase" }}>{item.timeframe}</div>
           </div>
-          <div style={{ borderRadius: 8, overflow: "hidden", background: "linear-gradient(180deg, rgba(12,18,30,0.48), rgba(8,12,22,0.82))" }}>
+          <div style={{ borderRadius: 10, overflow: "hidden", background: "linear-gradient(180deg, rgba(12,18,30,0.42), rgba(8,12,22,0.84))", minHeight: 278 }}>
             <ActusChart
               symbol={item.symbol}
               candles={chartCandles}
@@ -2132,7 +2351,7 @@ function actusModePanel(
               height={278}
               entry={entryDisplay}
               invalidation={stopDisplay}
-              gammaOverlay={gammaOverlay}
+              gammaOverlay={chartGammaOverlay}
             />
           </div>
         </div>
@@ -2205,70 +2424,195 @@ function actusModePanel(
                 <div
                   style={{
                     display: "grid",
-                    gap: 10,
-                    padding: "12px 12px 10px",
-                    borderRadius: 14,
-                    background: "linear-gradient(180deg, rgba(10,15,25,0.82), rgba(7,11,19,0.94))",
-                    border: "1px solid rgba(118,138,176,0.14)",
-                    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)",
-                    maxWidth: 640,
+                    gap: 12,
+                    padding: "14px 14px 12px",
+                    borderRadius: 16,
+                    background:
+                      "radial-gradient(circle at top right, rgba(255,224,130,0.08), transparent 28%), linear-gradient(180deg, rgba(10,15,25,0.88), rgba(7,11,19,0.97))",
+                    border: "1px solid rgba(118,138,176,0.16)",
+                    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.035), 0 12px 28px rgba(0,0,0,0.18)",
+                    maxWidth: 680,
                   }}
                 >
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                    <div style={{ display: "grid", gap: 2 }}>
-                      <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>ACTUS Decision</div>
-                      <div style={{ fontSize: 16, fontWeight: 800, color: "#f4f7fb", letterSpacing: "-0.02em" }}>
-                        {unifiedPositioning.bias === "NEUTRAL"
-                          ? unifiedPositioning.condition.replace("_", " ")
-                          : `${unifiedPositioning.bias} ${unifiedPositioning.condition.replace("_", " ")}`}
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+                    <div style={{ display: "grid", gap: 5 }}>
+                      <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>ACTUS Decision</div>
+                      <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+                        <div style={{ fontSize: 19, fontWeight: 820, color: "#f4f7fb", letterSpacing: "-0.03em", lineHeight: 1.05 }}>
+                          {unifiedPositioning.bias === "NEUTRAL"
+                            ? unifiedPositioning.condition.replace("_", " ")
+                            : `${unifiedPositioning.bias} ${unifiedPositioning.condition.replace("_", " ")}`}
+                        </div>
+                        <div style={{ fontSize: 12, color: "#9fb0cb", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                          {unifiedPositioning.regime}
+                        </div>
+                      </div>
+                      <div style={{ fontSize: 12, color: "#aebdd8", lineHeight: 1.4 }}>
+                        {unifiedPositioning.positioningType === "REAL_GAMMA"
+                          ? "Real positioning levels are in force."
+                          : unifiedPositioning.positioningType === "POSITIONING_PROXY"
+                            ? "Proxy positioning is guiding the decision surface."
+                            : "No options positioning data is available."}
                       </div>
                     </div>
-                    <div
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 8,
-                        padding: "7px 10px",
-                        borderRadius: 999,
-                        color: positioningPill.color,
-                        background: positioningPill.background,
-                        border: `1px solid ${positioningPill.border}`,
-                        fontSize: 11,
-                        letterSpacing: "0.06em",
-                        textTransform: "uppercase",
-                        fontWeight: 700,
-                      }}
-                    >
-                      {positioningPill.label}
+                    <div style={{ display: "grid", gap: 8, justifyItems: "end" }}>
+                      <div
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "8px 11px",
+                          borderRadius: 999,
+                          color: positioningPill.color,
+                          background: positioningPill.background,
+                          border: `1px solid ${positioningPill.border}`,
+                          fontSize: 11,
+                          letterSpacing: "0.08em",
+                          textTransform: "uppercase",
+                          fontWeight: 800,
+                          boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 20px ${positioningPill.background}`,
+                        }}
+                      >
+                        {positioningPill.label}
+                      </div>
+                      <div
+                        style={{
+                          display: "grid",
+                          gap: 2,
+                          minWidth: 96,
+                          padding: "9px 11px",
+                          borderRadius: 12,
+                          background: "linear-gradient(180deg, rgba(255,224,130,0.09), rgba(255,224,130,0.03))",
+                          border: "1px solid rgba(255,224,130,0.2)",
+                          textAlign: "right",
+                        }}
+                      >
+                        <div style={{ fontSize: 10, color: "#bda86a", letterSpacing: "0.08em", textTransform: "uppercase" }}>Confidence</div>
+                        <div style={{ fontSize: 22, fontWeight: 820, color: "#ffe082", letterSpacing: "-0.03em", lineHeight: 1 }}>
+                          {Math.round(unifiedPositioning.confidence * 100)}%
+                        </div>
+                      </div>
                     </div>
                   </div>
 
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
+                    {decisionPanelField("Positioning", positioningPill.label.replace("Positioning: ", ""), positioningTypeTone(unifiedPositioning.positioningType))}
                     {decisionPanelField("Regime", unifiedPositioning.regime)}
                     {decisionPanelField("Bias", unifiedPositioning.bias, gammaBiasTone(unifiedPositioning.bias))}
                     {decisionPanelField("Condition", unifiedPositioning.condition.replace("_", " "), gammaConditionTone(unifiedPositioning.condition))}
-                    {decisionPanelField("Confidence", `${Math.round(unifiedPositioning.confidence * 100)}%`, "#ffe082")}
-                    {decisionPanelField("Positioning", positioningPill.label.replace("Positioning: ", ""), positioningTypeTone(unifiedPositioning.positioningType))}
                   </div>
 
                   {decisionDrivers.length ? (
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                      {decisionDrivers.map((driver) => (
-                        <span
-                          key={driver}
+                    <div style={{ display: "grid", gap: 6 }}>
+                      <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Drivers</div>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        {decisionDrivers.map((driver, index) => (
+                          <span
+                            key={driver}
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 7,
+                              fontSize: 11,
+                              color: "#dbe6f8",
+                              background: "rgba(255,255,255,0.035)",
+                              border: "1px solid rgba(142,160,191,0.16)",
+                              borderRadius: 999,
+                              padding: "6px 10px",
+                              lineHeight: 1.2,
+                              fontWeight: 600,
+                            }}
+                          >
+                            <span style={{ color: "#8ea0bf", fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                              {index + 1}
+                            </span>
+                            <span>{driver}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {deltaSignal ? (
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: 10,
+                        padding: "12px 12px 10px",
+                        borderRadius: 14,
+                        background:
+                          "radial-gradient(circle at top right, rgba(103,183,255,0.05), transparent 28%), linear-gradient(180deg, rgba(8,12,20,0.72), rgba(5,8,15,0.9))",
+                        border: "1px solid rgba(118,138,176,0.12)",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+                        <div style={{ display: "grid", gap: 4 }}>
+                          <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Delta Read</div>
+                          <div style={{ fontSize: 12, color: "#aebdd8", lineHeight: 1.35 }}>
+                            {deltaSummary(deltaSignal)}
+                          </div>
+                        </div>
+                        <div
                           style={{
-                            fontSize: 11,
-                            color: "#d5e1f6",
-                            background: "rgba(255,255,255,0.03)",
-                            border: "1px solid rgba(142,160,191,0.14)",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 8,
+                            padding: "7px 10px",
                             borderRadius: 999,
-                            padding: "5px 9px",
-                            lineHeight: 1.2,
+                            color: deltaTone.color,
+                            background: deltaTone.background,
+                            border: `1px solid ${deltaTone.border}`,
+                            fontSize: 10,
+                            letterSpacing: "0.08em",
+                            textTransform: "uppercase",
+                            fontWeight: 800,
+                            boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 16px ${deltaTone.background}`,
                           }}
                         >
-                          {driver}
-                        </span>
-                      ))}
+                          <span
+                            style={{
+                              width: 6,
+                              height: 6,
+                              borderRadius: 999,
+                              background: deltaTone.color,
+                              boxShadow: `0 0 10px ${deltaTone.color}`,
+                            }}
+                          />
+                          <span>{deltaTone.label}</span>
+                        </div>
+                      </div>
+
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                        {deltaPanelField(
+                          "Bias",
+                          deltaSignal.deltaDirectionalAvailable ? (deltaSignal.bias ?? "NEUTRAL") : "NEUTRAL",
+                          gammaBiasTone(deltaSignal.deltaDirectionalAvailable ? deltaSignal.bias ?? "NEUTRAL" : "NEUTRAL"),
+                          deltaSignal.deltaDirectionalAvailable ? "Directional flow" : "No directional edge",
+                        )}
+                        {deltaPanelField(
+                          "Condition",
+                          (deltaSignal.condition ?? "NEUTRAL").replace("_", " "),
+                          deltaSignal.deltaAvailability === "DIRECTIONAL"
+                            ? deltaSignal.condition === "ACCUMULATION"
+                              ? "#3ef0a6"
+                              : deltaSignal.condition === "DISTRIBUTION"
+                                ? "#ff8ea8"
+                                : "#67b7ff"
+                            : "#c8d5ee",
+                        )}
+                        {deltaPanelField(
+                          "Read Quality",
+                          deltaStrengthLabel(deltaSignal),
+                          deltaStrengthTone(deltaSignal),
+                          deltaSignal.deltaAvailability === "DIRECTIONAL"
+                            ? "Net known flow imbalance"
+                            : deltaSignal.deltaAvailability === "SOURCE_ONLY"
+                              ? "Source active"
+                              : deltaSignal.deltaAvailability === "UNSUPPORTED"
+                                ? "Not in current stack"
+                                : "No usable source",
+                        )}
+                      </div>
                     </div>
                   ) : null}
                 </div>
@@ -2463,6 +2807,7 @@ export default function App() {
     updatedAt: null,
   });
   const [actusModeGammaBase, setActusModeGammaBase] = useState<GammaOverlay | null>(null);
+  const [actusModeDeltaSignal, setActusModeDeltaSignal] = useState<DeltaSignal | null>(null);
   const [nowTick, setNowTick] = useState(0);
   const [commandHistory, setCommandHistory] = useState<CommandHistoryEntry[]>([]);
   const [inAppAlert, setInAppAlert] = useState<InAppAlert | null>(null);
@@ -2786,11 +3131,15 @@ export default function App() {
       return null;
     }
     if (!actusModeLiveAsset) {
-      return actusModeSelection.snapshot;
+      return {
+        ...actusModeSelection.snapshot,
+        timeframe: actusModeSelection.timeframe,
+      };
     }
 
     return {
       ...actusModeLiveAsset,
+      timeframe: actusModeSelection.timeframe,
       direction: actusModeSelection.snapshot.direction,
       setupType: actusModeSelection.snapshot.setupType,
       actionLine: actusModeSelection.snapshot.actionLine,
@@ -2802,6 +3151,24 @@ export default function App() {
       contextLine: actusModeSelection.snapshot.contextLine,
     };
   }, [actusModeLiveAsset, actusModeSelection]);
+  useEffect(() => {
+    if (!actusModeSelection || actusModeSelection.timeframe === selectedTimeframe) {
+      return;
+    }
+
+    setActusModeSelection((current) =>
+      current
+        ? {
+            ...current,
+            timeframe: selectedTimeframe,
+            snapshot: {
+              ...current.snapshot,
+              timeframe: selectedTimeframe,
+            },
+          }
+        : current,
+    );
+  }, [actusModeSelection, selectedTimeframe]);
   const actusModeStreamAsset = useMemo(() => resolveActusLiveAsset(actusModeAsset), [actusModeAsset]);
 
   useEffect(() => {
@@ -3031,12 +3398,17 @@ export default function App() {
       return actusModeLiveChart.candles;
     }
 
-    if (actusModeLiveChart.supported && !actusModeLiveChart.historyResolved) {
-      return null;
+    const fallbackCandles =
+      actusModeDisplayAsset && hasRenderableActusSparkline(actusModeDisplayAsset.sparkline)
+        ? buildSparklineFallbackCandles(actusModeDisplayAsset)
+        : null;
+
+    if (fallbackCandles) {
+      return fallbackCandles;
     }
 
-    if (actusModeDisplayAsset && hasRenderableActusSparkline(actusModeDisplayAsset.sparkline)) {
-      return buildSparklineFallbackCandles(actusModeDisplayAsset);
+    if (actusModeLiveChart.supported && !actusModeLiveChart.historyResolved) {
+      return null;
     }
 
     return null;
@@ -3096,7 +3468,37 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [actusModeDisplayAsset?.symbol]);
+  }, [actusModeDisplayAsset?.symbol, actusModeDisplayAsset?.timeframe, actusModeDisplayAsset?.price]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!actusModeDisplayAsset) {
+      setActusModeDeltaSignal(null);
+      return;
+    }
+
+    setActusModeDeltaSignal(null);
+
+    void resolveActusDeltaSignal(actusModeDisplayAsset)
+      .then((signal) => {
+        if (!cancelled) {
+          setActusModeDeltaSignal(signal);
+        }
+      })
+      .catch((error) => {
+        Sentry.captureException(error, {
+          tags: { scope: "actus-delta-signal", symbol: actusModeDisplayAsset.symbol },
+        });
+        if (!cancelled) {
+          setActusModeDeltaSignal(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [actusModeDisplayAsset?.symbol, actusModeDisplayAsset?.timeframe, actusModeDisplayAsset?.price]);
 
   const actusModeGammaOverlay = useMemo(
     () =>
@@ -3110,6 +3512,60 @@ export default function App() {
         : null,
     [actusModeDisplayAsset, actusModeGammaBase],
   );
+  const actusModeUnifiedPositioning = useMemo(
+    () => (actusModeDisplayAsset ? deriveActusPositioning(actusModeDisplayAsset, actusModeGammaOverlay, actusModeDeltaSignal) : null),
+    [actusModeDeltaSignal, actusModeDisplayAsset, actusModeGammaOverlay],
+  );
+  const actusModeChartGammaOverlay = useMemo(
+    () =>
+      actusModeDisplayAsset
+        ? buildActusChartGammaOverlay(actusModeDisplayAsset, actusModeUnifiedPositioning, actusModeGammaOverlay)
+        : null,
+    [actusModeDisplayAsset, actusModeGammaOverlay, actusModeUnifiedPositioning],
+  );
+  useEffect(() => {
+    if (!actusModeDisplayAsset) {
+      return;
+    }
+
+    const normalizedSymbol = actusModeDisplayAsset.symbol.toUpperCase();
+    const traceSymbol =
+      normalizedSymbol === "XAU/USD" ? "XAU" : normalizedSymbol === "CL" ? "OIL" : normalizedSymbol;
+    if (!["NQ", "XAU", "OIL"].includes(traceSymbol)) {
+      return;
+    }
+
+    console.info("[ACTUS][OVERLAY HANDOFF]", {
+      asset: `${traceSymbol} ${actusModeDisplayAsset.timeframe}`,
+      positioningType: actusModeUnifiedPositioning?.positioningType ?? "NONE",
+      gammaSourceAvailable: actusModeUnifiedPositioning?.gammaSourceAvailable ?? false,
+      gammaLevelsAvailable: actusModeUnifiedPositioning?.gammaLevelsAvailable ?? false,
+      gammaDirectionalAvailable: actusModeUnifiedPositioning?.gammaDirectionalAvailable ?? false,
+      gammaFlip: actusModeChartGammaOverlay?.gammaFlip ?? null,
+      callWall: actusModeChartGammaOverlay?.callWall ?? null,
+      putWall: actusModeChartGammaOverlay?.putWall ?? null,
+      anchor: actusModeChartGammaOverlay?.anchor ?? null,
+      spotReference: actusModeChartGammaOverlay?.spotReference ?? null,
+      source: actusModeChartGammaOverlay?.source ?? null,
+    });
+  }, [actusModeChartGammaOverlay, actusModeDisplayAsset, actusModeUnifiedPositioning]);
+  useEffect(() => {
+    const traceKey = actusTraceDepthKey(actusModeAsset?.symbol, actusModeAsset?.timeframe ?? null);
+    if (!traceKey) {
+      return;
+    }
+
+    console.info("[ACTUS][DELTA]", {
+      asset: traceKey,
+      deltaSourceAvailable: actusModeDeltaSignal?.deltaSourceAvailable ?? false,
+      deltaDirectionalAvailable: actusModeDeltaSignal?.deltaDirectionalAvailable ?? false,
+      bias: actusModeDeltaSignal?.bias ?? null,
+      strength: actusModeDeltaSignal?.strength ?? null,
+      condition: actusModeDeltaSignal?.condition ?? null,
+      source: actusModeDeltaSignal?.source ?? null,
+      updatedAt: actusModeDeltaSignal?.updatedAt ?? null,
+    });
+  }, [actusModeAsset?.symbol, actusModeAsset?.timeframe, actusModeDeltaSignal]);
   const actusModeClosedPosition = useMemo(
     () => (actusModeDisplayAsset ? closedPositions[setupKey(actusModeDisplayAsset)] ?? null : null),
     [actusModeDisplayAsset, closedPositions],
@@ -3217,7 +3673,7 @@ export default function App() {
   ].filter(Boolean) as string[];
 
   const hero = filteredHero;
-  const showFirstLoadSkeleton = loading && !hasCachedInputs;
+  const showFirstLoadSkeleton = loading && !hasCachedInputs && !actusModeSelection;
   const topStatus = topBarStatus(snapshot.status.mode, snapshot.status.health);
   const lastUpdatedText = updateLabel(snapshot.status.mode, snapshot.status.health, snapshot.status.lastUpdatedLabel);
 
@@ -3229,8 +3685,11 @@ export default function App() {
 
     setActusModeSelection({
       symbol: selected.symbol,
-      timeframe: selected.timeframe,
-      snapshot: selected,
+      timeframe: selectedTimeframe,
+      snapshot: {
+        ...selected,
+        timeframe: selectedTimeframe,
+      },
     });
   };
 
@@ -3470,6 +3929,7 @@ export default function App() {
               actusModeDisplayAsset,
               actusModeChartCandles,
               actusModeGammaOverlay,
+              actusModeDeltaSignal,
               nowTick,
               () => setActusModeSelection(null),
               actusModePosition,

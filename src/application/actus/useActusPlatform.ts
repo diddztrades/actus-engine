@@ -92,23 +92,30 @@ export function useActusPlatform(timeframe: ActusTimeframe) {
 
     const cards = getLiveBackendCards(timeframe);
     const contexts = getLiveHybridContexts(timeframe);
-    let fusedInputs: ActusNormalizedMarketInput[];
+    const seededInputs = contexts.map(normalizeHybridContext);
+    let fusedInputs: ActusNormalizedMarketInput[] = seededInputs;
+
+    cachedMacroSnapshot = macroResult;
+    cachedSystemSnapshot = systemResult;
+    setMacroSnapshot(macroResult);
+    setSystemSnapshot(systemResult);
+
+    if (seededInputs.length > 0) {
+      marketInputsCache[timeframe] = seededInputs;
+      setMarketInputs(seededInputs);
+      setRefreshTick((tick) => tick + 1);
+      setLoading(false);
+    }
 
     if (cards.length > 0) {
       try {
         fusedInputs = await buildLiveBoardInputs(cards, timeframe);
       } catch {
-        fusedInputs = contexts.map(normalizeHybridContext);
+        fusedInputs = seededInputs;
       }
-    } else {
-      fusedInputs = contexts.map(normalizeHybridContext);
     }
 
-    cachedMacroSnapshot = macroResult;
-    cachedSystemSnapshot = systemResult;
     marketInputsCache[timeframe] = fusedInputs;
-    setMacroSnapshot(macroResult);
-    setSystemSnapshot(systemResult);
     setMarketInputs(fusedInputs);
     setRefreshTick((tick) => tick + 1);
     setLoading(false);

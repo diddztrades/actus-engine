@@ -1,5 +1,6 @@
 import type { ActusOpportunityOutput } from "../domain/market/types";
 import type { GammaOverlay } from "../types/chart";
+import type { DeltaSignal } from "../types/delta";
 
 export type ActusPositioning = {
   positioningAvailable: boolean;
@@ -32,6 +33,8 @@ type GammaAvailability = {
   directionalAvailable: boolean;
 };
 
+type AlignmentState = "STRONG" | "MIXED" | "WEAK";
+
 type StructuralContext = {
   spot: number | null;
   upper: number | null;
@@ -40,6 +43,11 @@ type StructuralContext = {
   insideWalls: boolean;
   normalizedBandDistance: number;
   normalizedAnchorDistance: number;
+};
+
+type DeltaFusion = {
+  confidenceDelta: number;
+  driver: string | null;
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -52,6 +60,32 @@ function round(value: number, digits = 3) {
 
 function uniqueDrivers(drivers: string[]) {
   return [...new Set(drivers.filter(Boolean))].slice(0, 4);
+}
+
+function orderedDrivers(drivers: string[]) {
+  const priority = new Map<string, number>([
+    ["delta conflict", 0],
+    ["positioning aligned", 1],
+    ["market pinned", 2],
+    ["delta aligned", 3],
+    ["price behavior aligned", 4],
+    ["flow present, not directional", 5],
+    ["breakout pressure", 6],
+    ["range pressure", 7],
+    ["reversal pressure", 8],
+    ["expansion risk", 9],
+    ["positioning proxy active", 10],
+    ["no options positioning data", 11],
+    ["price behavior only", 12],
+  ]);
+
+  return [...new Set(drivers.filter(Boolean))]
+    .sort((a, b) => {
+      const aPriority = priority.get(a) ?? 100;
+      const bPriority = priority.get(b) ?? 100;
+      return aPriority - bPriority || a.localeCompare(b);
+    })
+    .slice(0, 4);
 }
 
 function isFiniteNumber(value: number | null | undefined): value is number {
@@ -110,79 +144,105 @@ function deriveStructuralContext(
   };
 }
 
-function deriveProxyConfidence(
-  item: ActusOpportunityOutput,
-  regime: ActusPositioning["regime"],
-  condition: ActusPositioning["condition"],
+function deriveAlignmentState(
   bias: ActusPositioning["bias"],
-  structure: StructuralContext,
-  priceDecision: PriceBehaviorDecision,
-): number {
-  let score = 0.24;
-
-  const context = item.positioningContext;
-  if (context?.confidence === "high") score += 0.12;
-  else if (context?.confidence === "medium") score += 0.07;
-  else score += 0.03;
-
-  if (regime === "PIN") {
-    score += structure.insideWalls ? 0.14 : 0.06;
-    score += (1 - structure.normalizedBandDistance) * 0.08;
-  } else {
-    score += bias !== "NEUTRAL" ? 0.1 : 0.03;
-    score += priceDecision.bias === bias && bias !== "NEUTRAL" ? 0.08 : 0;
-  }
-
-  if (condition === "BREAKOUT") score += 0.08;
-  if (condition === "MEAN_REVERSION") score += 0.04;
-  if (condition === "TRAP") score -= 0.26;
-
-  score += priceDecision.confidence * 0.18;
-
-  if (item.riskState === "unstable") score -= 0.1;
-  if (item.riskState === "crowded") score -= 0.08;
-  if (item.riskState === "late") score -= 0.16;
-  if (item.freshnessState === "stale") score -= 0.1;
-
-  return round(clamp(score, 0.08, 0.72));
+  priceBias: PriceBehaviorDecision["bias"],
+  condition: ActusPositioning["condition"],
+): AlignmentState {
+  if (condition === "TRAP") return "WEAK";
+  if (bias === "NEUTRAL" || priceBias === "NEUTRAL") return "MIXED";
+  if (bias === priceBias) return "STRONG";
+  return "WEAK";
 }
 
-function deriveRealGammaConfidence(
-  gammaAvailability: GammaAvailability,
-  regime: ActusPositioning["regime"],
-  condition: ActusPositioning["condition"],
-  bias: ActusPositioning["bias"],
+function alignmentStrength(alignment: AlignmentState) {
+  if (alignment === "STRONG") return 0.88;
+  if (alignment === "MIXED") return 0.44;
+  return 0.08;
+}
+
+function derivePositioningStrength(
   structure: StructuralContext,
-  priceDecision: PriceBehaviorDecision,
-  gammaConfidence: number,
+  regime: ActusPositioning["regime"],
+  bias: ActusPositioning["bias"],
+  directionalAvailable: boolean,
 ): number {
-  let score = gammaAvailability.directionalAvailable ? 0.42 : 0.26;
+  const anchorProximity = 1 - structure.normalizedAnchorDistance;
+  const bandCenterProximity = 1 - structure.normalizedBandDistance;
 
-  if (gammaAvailability.sourceAvailable) score += 0.03;
-  if (gammaAvailability.levelsAvailable) score += 0.05;
-
-  if (gammaAvailability.directionalAvailable) {
-    score += gammaConfidence * 0.16;
-    if (bias !== "NEUTRAL" && priceDecision.bias === bias) score += 0.08;
-    else if (bias !== "NEUTRAL" && priceDecision.bias !== "NEUTRAL" && priceDecision.bias !== bias) score -= 0.08;
-    score += (1 - structure.normalizedAnchorDistance) * 0.06;
-  } else {
-    if (regime === "PIN") {
-      score += structure.insideWalls ? 0.08 : 0.03;
-      score += (1 - structure.normalizedBandDistance) * 0.06;
-    } else {
-      score += priceDecision.bias !== "NEUTRAL" ? 0.06 : 0.02;
-      score += priceDecision.bias === bias && bias !== "NEUTRAL" ? 0.05 : 0;
-    }
+  if (regime === "PIN") {
+    const pinStrength = structure.insideWalls ? 0.55 : 0.2;
+    return round(clamp(pinStrength * 0.55 + anchorProximity * 0.25 + bandCenterProximity * 0.2, 0, 1));
   }
 
-  if (condition === "BREAKOUT") score += 0.06;
-  if (condition === "MEAN_REVERSION") score += 0.02;
-  if (condition === "TRAP") score -= 0.28;
+  let wallProximity = 0.25;
+  if (bias === "LONG" && isFiniteNumber(structure.upper) && isFiniteNumber(structure.spot) && structure.upper !== 0) {
+    wallProximity = 1 - clamp(Math.abs((structure.upper - structure.spot) / structure.upper) / 0.01, 0, 1);
+  } else if (bias === "SHORT" && isFiniteNumber(structure.lower) && isFiniteNumber(structure.spot) && structure.lower !== 0) {
+    wallProximity = 1 - clamp(Math.abs((structure.spot - structure.lower) / structure.lower) / 0.01, 0, 1);
+  }
 
-  score += priceDecision.confidence * (gammaAvailability.directionalAvailable ? 0.08 : 0.06);
+  const flipDistanceStrength = directionalAvailable ? anchorProximity : 0.42;
+  return round(clamp(flipDistanceStrength * 0.55 + wallProximity * 0.45, 0, 1));
+}
 
-  return round(clamp(score, gammaAvailability.directionalAvailable ? 0.14 : 0.12, gammaAvailability.directionalAvailable ? 0.9 : 0.68));
+function regimeStrength(regime: ActusPositioning["regime"]) {
+  return regime === "EXPANSION" ? 0.78 : 0.26;
+}
+
+function compressConfidenceTopEnd(value: number, ceiling: number) {
+  const threshold = 0.74;
+  if (value <= threshold) {
+    return value;
+  }
+
+  const overflow = value - threshold;
+  const compressed = threshold + overflow * 0.28;
+  return Math.min(compressed, ceiling);
+}
+
+function deriveCalibratedConfidence(
+  positioningStrength: number,
+  alignment: AlignmentState,
+  regime: ActusPositioning["regime"],
+  condition: ActusPositioning["condition"],
+  positioningType: ActusPositioning["positioningType"],
+  directionalAvailable: boolean,
+): number {
+  const alignmentScore = alignmentStrength(alignment);
+  const regimeScore = regimeStrength(regime);
+  let score = positioningStrength * 0.46 + alignmentScore * 0.36 + regimeScore * 0.18;
+
+  if (condition === "TRAP") score -= 0.34;
+  else if (condition === "BREAKOUT") score += 0.035;
+  else score -= 0.035;
+
+  if (positioningType === "POSITIONING_PROXY") {
+    score -= 0.15;
+  } else if (!directionalAvailable) {
+    score -= 0.1;
+  } else {
+    score += 0.03;
+  }
+
+  const maxConfidence =
+    condition === "TRAP"
+      ? 0.22
+      : positioningType === "POSITIONING_PROXY"
+        ? 0.58
+        : directionalAvailable
+          ? 0.88
+          : 0.64;
+  const minConfidence =
+    condition === "TRAP" ? 0.03 : positioningType === "POSITIONING_PROXY" ? 0.08 : 0.1;
+
+  const normalized = clamp(score, minConfidence, maxConfidence);
+  const compressed =
+    condition === "TRAP"
+      ? normalized
+      : compressConfidenceTopEnd(normalized, maxConfidence);
+
+  return round(clamp(compressed, minConfidence, maxConfidence));
 }
 
 function derivePriceBehaviorDecision(item: ActusOpportunityOutput): PriceBehaviorDecision {
@@ -221,7 +281,46 @@ function derivePriceBehaviorDecision(item: ActusOpportunityOutput): PriceBehavio
   };
 }
 
-function deriveProxyPositioning(item: ActusOpportunityOutput): ActusPositioning | null {
+function deriveDeltaFusion(
+  signal: DeltaSignal | null,
+  bias: ActusPositioning["bias"],
+  condition: ActusPositioning["condition"],
+): DeltaFusion {
+  if (!signal || signal.deltaAvailability === "UNAVAILABLE" || signal.deltaAvailability === "UNSUPPORTED") {
+    return { confidenceDelta: 0, driver: null };
+  }
+
+  if (signal.deltaAvailability === "SOURCE_ONLY") {
+    return {
+      confidenceDelta: condition === "TRAP" ? 0 : 0.008,
+      driver: "flow present, not directional",
+    };
+  }
+
+  if (!signal.deltaDirectionalAvailable || bias === "NEUTRAL" || condition === "TRAP") {
+    return { confidenceDelta: 0, driver: null };
+  }
+
+  const deltaBias = signal.bias ?? "NEUTRAL";
+  const strength = clamp(signal.strength ?? 0, 0, 1);
+  if (deltaBias === "NEUTRAL") {
+    return { confidenceDelta: 0, driver: null };
+  }
+
+  if (deltaBias === bias) {
+    return {
+      confidenceDelta: round(0.014 + strength * 0.028, 3),
+      driver: "delta aligned",
+    };
+  }
+
+  return {
+    confidenceDelta: round(-(0.038 + strength * 0.045), 3),
+    driver: "delta conflict",
+  };
+}
+
+function deriveProxyPositioning(item: ActusOpportunityOutput, deltaSignal: DeltaSignal | null): ActusPositioning | null {
   const context = item.positioningContext;
   if (!context) {
     return {
@@ -292,6 +391,8 @@ function deriveProxyPositioning(item: ActusOpportunityOutput): ActusPositioning 
     condition === "TRAP" ? "NEUTRAL" : regime === "PIN" ? "NEUTRAL" : rawBias;
   const priceDecision = derivePriceBehaviorDecision(item);
   const structure = deriveStructuralContext(item.price, upper, lower, anchor);
+  const alignment = deriveAlignmentState(bias, priceDecision.bias, condition);
+  const positioningStrength = derivePositioningStrength(structure, regime, bias, false);
 
   const drivers = uniqueDrivers([
     "positioning proxy active",
@@ -299,6 +400,7 @@ function deriveProxyPositioning(item: ActusOpportunityOutput): ActusPositioning 
     regime === "PIN" ? "market pinned" : "breakout pressure",
     condition === "TRAP" ? "expansion risk" : null,
   ].filter(Boolean) as string[]);
+  const deltaFusion = deriveDeltaFusion(deltaSignal, bias, condition);
 
   return {
     positioningAvailable: true,
@@ -308,14 +410,28 @@ function deriveProxyPositioning(item: ActusOpportunityOutput): ActusPositioning 
     gammaDirectionalAvailable: false,
     regime,
     bias,
-    confidence: deriveProxyConfidence(item, regime, condition, bias, structure, priceDecision),
+    confidence: round(
+      clamp(
+        deriveCalibratedConfidence(positioningStrength, alignment, regime, condition, "POSITIONING_PROXY", false) +
+          deltaFusion.confidenceDelta,
+        condition === "TRAP" ? 0.03 : 0.08,
+        condition === "TRAP" ? 0.22 : 0.58,
+      ),
+    ),
     condition,
-    drivers,
+    drivers: orderedDrivers([
+      deltaFusion.driver,
+      ...drivers,
+    ].filter(Boolean) as string[]),
     levels: { upper, lower, anchor },
   };
 }
 
-export function deriveActusPositioning(item: ActusOpportunityOutput, gammaOverlay: GammaOverlay | null): ActusPositioning | null {
+export function deriveActusPositioning(
+  item: ActusOpportunityOutput,
+  gammaOverlay: GammaOverlay | null,
+  deltaSignal: DeltaSignal | null = null,
+): ActusPositioning | null {
   const priceDecision = derivePriceBehaviorDecision(item);
   const gammaAvailability = deriveGammaAvailability(gammaOverlay);
   const overlay = gammaOverlay;
@@ -325,11 +441,10 @@ export function deriveActusPositioning(item: ActusOpportunityOutput, gammaOverla
   const spot = isFiniteNumber(item.price) ? item.price : overlay?.spotReference ?? null;
 
   if (!overlay || !gammaAvailability.sourceAvailable || !gammaAvailability.levelsAvailable) {
-    return deriveProxyPositioning(item);
+    return deriveProxyPositioning(item, deltaSignal);
   }
 
   const gammaBias = overlay.bias ?? "NEUTRAL";
-  const gammaConfidence = typeof overlay.confidence === "number" ? overlay.confidence : 0;
   const anchor = overlay?.gammaFlip ?? (hasWallBand ? (upper + lower) / 2 : overlay?.spotReference ?? null);
   const structure = deriveStructuralContext(spot, upper, lower, anchor);
 
@@ -377,6 +492,25 @@ export function deriveActusPositioning(item: ActusOpportunityOutput, gammaOverla
         dominantPressure,
       ].filter(Boolean) as string[]);
 
+  const alignment = deriveAlignmentState(directionalBias, priceDecision.bias, condition);
+  const positioningStrength = derivePositioningStrength(structure, regime, directionalBias, gammaAvailability.directionalAvailable);
+  const baseConfidence = deriveCalibratedConfidence(
+    positioningStrength,
+    alignment,
+    regime,
+    condition,
+    "REAL_GAMMA",
+    gammaAvailability.directionalAvailable,
+  );
+  const deltaFusion = deriveDeltaFusion(deltaSignal, directionalBias, condition);
+  const minConfidence = condition === "TRAP" ? 0.03 : 0.1;
+  const maxConfidence =
+    condition === "TRAP"
+      ? 0.22
+      : gammaAvailability.directionalAvailable
+        ? 0.88
+        : 0.64;
+
   return {
     positioningAvailable: true,
     positioningType: "REAL_GAMMA",
@@ -385,17 +519,12 @@ export function deriveActusPositioning(item: ActusOpportunityOutput, gammaOverla
     gammaDirectionalAvailable: gammaAvailability.directionalAvailable,
     regime,
     bias: directionalBias,
-    confidence: deriveRealGammaConfidence(
-      gammaAvailability,
-      regime,
-      condition,
-      directionalBias,
-      structure,
-      priceDecision,
-      gammaConfidence,
-    ),
+    confidence: round(clamp(baseConfidence + deltaFusion.confidenceDelta, minConfidence, maxConfidence)),
     condition,
-    drivers,
+    drivers: orderedDrivers([
+      deltaFusion.driver,
+      ...drivers,
+    ].filter(Boolean) as string[]),
     levels: {
       upper,
       lower,

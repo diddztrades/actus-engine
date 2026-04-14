@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("node:path");
+const fs = require("node:fs");
 const { applyStateEngine, finalizeStateBoard, getStateCacheTtlMs } = require("./stateEngine.cjs");
 
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
@@ -70,26 +71,38 @@ const OPTIONS_CONFIGS = {
     maxContracts: 60,
     definitionLookbackDays: 3,
     maxExpiries: 2,
+    definitionLimit: 8000,
+    underlyingHistoryDays: 1,
+    underlyingHistoryLimit: 240,
+    enrichLiveContractData: true,
   },
   GC: {
     underlyingAsset: "GC",
     underlyingSymbol: "GC.c.0",
     optionParent: "OG.OPT",
     dataset: "GLBX.MDP3",
-    strikeWindowPct: 0.06,
-    maxContracts: 60,
-    definitionLookbackDays: 2,
-    maxExpiries: 2,
+    strikeWindowPct: 0.045,
+    maxContracts: 32,
+    definitionLookbackDays: 1,
+    maxExpiries: 1,
+    definitionLimit: 2500,
+    underlyingHistoryDays: 3,
+    underlyingHistoryLimit: 1800,
+    enrichLiveContractData: false,
   },
   CL: {
     underlyingAsset: "CL",
     underlyingSymbol: "CL.c.0",
     optionParent: "LO.OPT",
     dataset: "GLBX.MDP3",
-    strikeWindowPct: 0.08,
-    maxContracts: 60,
-    definitionLookbackDays: 2,
-    maxExpiries: 2,
+    strikeWindowPct: 0.06,
+    maxContracts: 36,
+    definitionLookbackDays: 1,
+    maxExpiries: 1,
+    definitionLimit: 3000,
+    underlyingHistoryDays: 2,
+    underlyingHistoryLimit: 1200,
+    enrichLiveContractData: false,
   },
 };
 const DATABENTO_FUTURES = {
@@ -102,6 +115,8 @@ const BOARD_DATABENTO_MAP = {
   "XAU/USD": "GC",
   CL: "CL",
 };
+const OPTION_CHAIN_CACHE_FILE = path.resolve(__dirname, "option-chain-cache.json");
+const OPTION_CHAIN_CACHE_TTL_MS = 15 * 60 * 1000;
 
 let cardsCache = {};
 let lastFetchAt = {};
@@ -110,6 +125,22 @@ let lastMode = "live-disconnected";
 let lastWarning = null;
 const stateTracker = new Map();
 const assetCardCache = new Map();
+const optionChainCache = new Map();
+const optionChainRefreshInFlight = new Map();
+
+try {
+  if (fs.existsSync(OPTION_CHAIN_CACHE_FILE)) {
+    const raw = fs.readFileSync(OPTION_CHAIN_CACHE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    Object.entries(parsed ?? {}).forEach(([asset, entry]) => {
+      if (entry?.snapshot && typeof entry?.cachedAt === "number") {
+        optionChainCache.set(asset, entry);
+      }
+    });
+  }
+} catch {
+  // Cache bootstrap is best-effort only.
+}
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
@@ -228,6 +259,10 @@ function databentoSafeEndIso() {
   return new Date(Date.now() - 30 * 60 * 1000).toISOString();
 }
 
+function databentoTradeSafeEndIso() {
+  return new Date(Date.now() - 20 * 60 * 1000).toISOString();
+}
+
 function isoMinutesBefore(referenceIso, minutes) {
   return new Date(Date.parse(referenceIso) - minutes * 60 * 1000).toISOString();
 }
@@ -256,6 +291,10 @@ function normalizeDatabentoTimeframe(value) {
 
 function getDatabentoFuture(asset) {
   return DATABENTO_FUTURES[asset];
+}
+
+function getDatabentoFutureParent(asset) {
+  return GAMMA_CONFIGS[asset]?.futureParent || null;
 }
 
 function aggregateCandles(rows, timeframe, future) {
@@ -346,16 +385,23 @@ async function fetchDatabentoFuturesHistory(asset, timeframe, options = {}) {
     options.start ??
     isoMinutesBefore(end, computedLookbackMinutes);
 
-  const rows = await databentoHistorical({
-    dataset: "GLBX.MDP3",
-    schema,
-    symbols: future.symbol,
-    stype_in: "continuous",
-    start,
-    end,
-    encoding: "csv",
-    limit: rawLimit,
-  });
+  const resolvedRows =
+    (await resolveActiveDatabentoFutureRows(asset, schema, start, end, rawLimit)) ?? {
+      rows: await databentoHistoricalWithAvailableEndRetry({
+        dataset: "GLBX.MDP3",
+        schema,
+        symbols: future.symbol,
+        stype_in: "continuous",
+        start,
+        end,
+        encoding: "csv",
+        limit: rawLimit,
+      }),
+      symbol: future.symbol,
+      sourceType: "continuous",
+    };
+
+  const rows = resolvedRows.rows;
 
   const aggregated = aggregateCandles(rows, normalizedTimeframe, future);
   if (normalizedTimeframe === "1h") {
@@ -366,6 +412,8 @@ async function fetchDatabentoFuturesHistory(asset, timeframe, options = {}) {
     console.info("[ACTUS][1H][backend-fetch]", {
       asset,
       timeframe: normalizedTimeframe,
+      sourceSymbol: resolvedRows.symbol,
+      sourceType: resolvedRows.sourceType,
       requestedFinalLimit: requestedAggregatedLimit,
       rawMinuteRowsFetched: rows.length,
       firstRawTimestamp: firstRaw,
@@ -411,8 +459,62 @@ async function databentoHistorical(query) {
   return parseCsv(text);
 }
 
+function extractDatabentoAvailableEnd(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (!message) {
+    return null;
+  }
+
+  const normalizedFromJson = message.match(/"available_end"\s*:\s*"([^"]+)"/i)?.[1] ?? null;
+  if (normalizedFromJson) {
+    const parsed = new Date(normalizedFromJson).toISOString();
+    return Number.isFinite(Date.parse(parsed)) ? parsed : null;
+  }
+
+  const normalizedFromText = message.match(/available up to\s+([0-9:\-+\s.]+(?:Z|UTC)?)/i)?.[1] ?? null;
+  if (!normalizedFromText) {
+    return null;
+  }
+
+  const candidate = normalizedFromText.replace(/\s+/g, " ").trim().replace(" UTC", "Z").replace(" ", "T");
+  const parsed = Date.parse(candidate);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+async function databentoHistoricalWithAvailableEndRetry(query) {
+  try {
+    return await databentoHistorical(query);
+  } catch (error) {
+    const availableEnd = extractDatabentoAvailableEnd(error);
+    const currentEnd = typeof query.end === "string" ? query.end : null;
+    if (!availableEnd || !currentEnd || availableEnd === currentEnd) {
+      throw error;
+    }
+
+    return databentoHistorical({
+      ...query,
+      end: availableEnd,
+    });
+  }
+}
+
 function parseExpiration(value) {
-  const time = value ? Date.parse(value) : Number.NaN;
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    if (numeric > 1e15) {
+      return Math.floor(numeric / 1e6);
+    }
+    if (numeric > 1e12) {
+      return Math.floor(numeric / 1e3);
+    }
+    return numeric;
+  }
+
+  const time = Date.parse(value);
   return Number.isFinite(time) ? time : null;
 }
 
@@ -428,11 +530,92 @@ function pickNearestFutureDefinition(definitions) {
     .filter(
       (item) =>
         item.rawSymbol &&
+        !item.rawSymbol.includes("-") &&
         item.expiration &&
         item.expiration > now &&
         (item.securityType === "FUT" || item.instrumentClass === "F"),
     )
     .sort((a, b) => a.expiration - b.expiration)[0];
+}
+
+function pickCandidateFutureDefinitions(definitions, maxCount = 4) {
+  const now = Date.now();
+  return definitions
+    .map((item) => ({
+      rawSymbol: item.raw_symbol || item.symbol,
+      expiration: parseExpiration(item.expiration),
+      securityType: item.security_type || "",
+      instrumentClass: item.instrument_class || "",
+    }))
+    .filter(
+      (item) =>
+        item.rawSymbol &&
+        !item.rawSymbol.includes("-") &&
+        item.expiration &&
+        item.expiration > now &&
+        (item.securityType === "FUT" || item.instrumentClass === "F"),
+    )
+    .sort((a, b) => a.expiration - b.expiration)
+    .slice(0, maxCount);
+}
+
+async function resolveActiveDatabentoFutureRows(asset, schema, start, end, limit) {
+  const futureParent = getDatabentoFutureParent(asset);
+  if (!futureParent) {
+    return null;
+  }
+
+  const definitions = await databentoHistorical({
+    dataset: "GLBX.MDP3",
+    schema: "definition",
+    symbols: futureParent,
+    stype_in: "parent",
+    start: isoDateDaysAgo(3),
+    encoding: "csv",
+    limit: 500,
+  }).catch(() => []);
+
+  const candidates = pickCandidateFutureDefinitions(definitions);
+  let bestMatch = null;
+  for (const candidate of candidates) {
+    const rows = await databentoHistoricalWithAvailableEndRetry({
+      dataset: "GLBX.MDP3",
+      schema,
+      symbols: candidate.rawSymbol,
+      stype_in: "raw_symbol",
+      start,
+      end,
+      encoding: "csv",
+      limit,
+    }).catch(() => []);
+    if (rows.length) {
+      const latestTimestamp = Date.parse(rows[rows.length - 1]?.ts_event || "") || 0;
+      const nextMatch = {
+        rows,
+        symbol: candidate.rawSymbol,
+        sourceType: "raw_symbol",
+        score: rows.length,
+        latestTimestamp,
+      };
+      if (
+        !bestMatch ||
+        nextMatch.score > bestMatch.score ||
+        (nextMatch.score === bestMatch.score && nextMatch.latestTimestamp > bestMatch.latestTimestamp)
+      ) {
+        bestMatch = nextMatch;
+      }
+    }
+  }
+
+  if (!bestMatch) {
+    return null;
+  }
+
+  return {
+    rows: bestMatch.rows,
+    symbol: bestMatch.symbol,
+    sourceType: bestMatch.sourceType,
+  };
 }
 
 function normalizeOptionDefinition(row) {
@@ -465,9 +648,9 @@ async function buildOptionChainSnapshot(asset) {
 
   const safeEnd = databentoSafeEndIso();
   const underlyingCandles = await fetchDatabentoFuturesHistory(asset, "1m", {
-    start: asset === "GC" ? toIsoDaysAgo(7) : asset === "CL" ? toIsoDaysAgo(3) : toIsoMinutesAgo(240),
+    start: toIsoDaysAgo(config.underlyingHistoryDays ?? 1),
     end: safeEnd,
-    limit: asset === "GC" ? 4000 : asset === "CL" ? 1800 : 240,
+    limit: config.underlyingHistoryLimit ?? 240,
   });
   const latestUnderlying = underlyingCandles[underlyingCandles.length - 1];
 
@@ -480,10 +663,9 @@ async function buildOptionChainSnapshot(asset) {
     schema: "definition",
     symbols: config.optionParent,
     stype_in: "parent",
-    start: toIsoDaysAgo(config.definitionLookbackDays ?? 3),
-    end: safeEnd,
+    start: isoDateDaysAgo(config.definitionLookbackDays ?? 3),
     encoding: "csv",
-    limit: 8000,
+    limit: config.definitionLimit ?? 8000,
   });
 
   const optionDefinitions = definitions
@@ -538,38 +720,40 @@ async function buildOptionChainSnapshot(asset) {
   }
 
   const symbolQuery = selectedSymbols.join(",");
-  const [quotes, trades, statistics] = await Promise.all([
-    databentoHistorical({
-      dataset: config.dataset,
-      schema: "mbp-1",
-      symbols: symbolQuery,
-      stype_in: "raw_symbol",
-      start: isoMinutesBefore(safeEnd, 30),
-      end: safeEnd,
-      encoding: "csv",
-      limit: 50000,
-    }),
-    databentoHistorical({
-      dataset: config.dataset,
-      schema: "trades",
-      symbols: symbolQuery,
-      stype_in: "raw_symbol",
-      start: isoMinutesBefore(safeEnd, 90),
-      end: safeEnd,
-      encoding: "csv",
-      limit: 50000,
-    }),
-    databentoHistorical({
-      dataset: config.dataset,
-      schema: "statistics",
-      symbols: symbolQuery,
-      stype_in: "raw_symbol",
-      start: toIsoDaysAgo(3),
-      end: safeEnd,
-      encoding: "csv",
-      limit: 50000,
-    }).catch(() => []),
-  ]);
+  const [quotes, trades, statistics] = config.enrichLiveContractData === false
+    ? [[], [], []]
+    : await Promise.all([
+        databentoHistorical({
+          dataset: config.dataset,
+          schema: "mbp-1",
+          symbols: symbolQuery,
+          stype_in: "raw_symbol",
+          start: isoMinutesBefore(safeEnd, 30),
+          end: safeEnd,
+          encoding: "csv",
+          limit: 50000,
+        }).catch(() => []),
+        databentoHistorical({
+          dataset: config.dataset,
+          schema: "trades",
+          symbols: symbolQuery,
+          stype_in: "raw_symbol",
+          start: isoMinutesBefore(safeEnd, 90),
+          end: safeEnd,
+          encoding: "csv",
+          limit: 50000,
+        }).catch(() => []),
+        databentoHistorical({
+          dataset: config.dataset,
+          schema: "statistics",
+          symbols: symbolQuery,
+          stype_in: "raw_symbol",
+          start: toIsoDaysAgo(3),
+          end: safeEnd,
+          encoding: "csv",
+          limit: 50000,
+        }).catch(() => []),
+      ]);
 
   const latestQuoteBySymbol = new Map();
   quotes.forEach((row) => {
@@ -637,6 +821,58 @@ async function buildOptionChainSnapshot(asset) {
   };
 }
 
+async function getOptionChainSnapshot(asset, options = {}) {
+  const normalizedAsset = typeof asset === "string" ? asset.toUpperCase() : asset;
+  const cached = optionChainCache.get(normalizedAsset) ?? null;
+  const cacheAgeMs = cached ? Date.now() - cached.cachedAt : Number.POSITIVE_INFINITY;
+  const cacheFresh = cacheAgeMs <= OPTION_CHAIN_CACHE_TTL_MS;
+
+  if (cached?.snapshot && cacheFresh && !options.forceRefresh) {
+    return cached.snapshot;
+  }
+
+  if (cached?.snapshot && !cacheFresh && !optionChainRefreshInFlight.has(normalizedAsset) && !options.forceRefresh) {
+    optionChainRefreshInFlight.set(
+      normalizedAsset,
+      buildOptionChainSnapshot(normalizedAsset)
+        .then((snapshot) => {
+          optionChainCache.set(normalizedAsset, { cachedAt: Date.now(), snapshot });
+          persistOptionChainCache();
+        })
+        .catch(() => {})
+        .finally(() => {
+          optionChainRefreshInFlight.delete(normalizedAsset);
+        }),
+    );
+
+    return cached.snapshot;
+  }
+
+  if (!options.forceRefresh && optionChainRefreshInFlight.has(normalizedAsset)) {
+    if (cached?.snapshot) {
+      return cached.snapshot;
+    }
+    await optionChainRefreshInFlight.get(normalizedAsset);
+    const refreshed = optionChainCache.get(normalizedAsset);
+    if (refreshed?.snapshot) {
+      return refreshed.snapshot;
+    }
+  }
+
+  const buildPromise = buildOptionChainSnapshot(normalizedAsset)
+    .then((snapshot) => {
+      optionChainCache.set(normalizedAsset, { cachedAt: Date.now(), snapshot });
+      persistOptionChainCache();
+      return snapshot;
+    })
+    .finally(() => {
+      optionChainRefreshInFlight.delete(normalizedAsset);
+    });
+
+  optionChainRefreshInFlight.set(normalizedAsset, buildPromise);
+  return buildPromise;
+}
+
 function aggregateStrikeVolumes(trades, selectedSymbols, optionLookup) {
   const byStrike = new Map();
 
@@ -702,7 +938,7 @@ async function buildGammaSnapshot(asset, timeframe) {
       schema: "definition",
       symbols: config.futureParent,
       stype_in: "parent",
-      start: toIsoDaysAgo(3),
+      start: isoDateDaysAgo(3),
       encoding: "csv",
       limit: 500,
     }),
@@ -711,7 +947,7 @@ async function buildGammaSnapshot(asset, timeframe) {
       schema: "definition",
       symbols: config.optionParent,
       stype_in: "parent",
-      start: toIsoDaysAgo(3),
+      start: isoDateDaysAgo(3),
       encoding: "csv",
       limit: 25000,
     }),
@@ -727,6 +963,7 @@ async function buildGammaSnapshot(asset, timeframe) {
     schema: timeframe === "1h" ? "ohlcv-1h" : "ohlcv-1m",
     symbols: nearestFuture.rawSymbol,
     start: timeframe === "1h" ? toIsoDaysAgo(5) : toIsoMinutesAgo(180),
+    end: databentoSafeEndIso(),
     encoding: "csv",
     limit: timeframe === "1h" ? 64 : 240,
   });
@@ -1088,6 +1325,270 @@ async function buildActusGammaOverlay(asset, options = {}) {
   throw new Error(`Unsupported overlay asset: ${asset}`);
 }
 
+const DELTA_CONFIGS = {
+  NQ: {
+    windowMinutes: 30,
+    minDirectionalStrength: 0.12,
+    minDirectionalTrades: 24,
+    source: "databento-cme-futures-trades",
+  },
+  GC: {
+    windowMinutes: 240,
+    minDirectionalStrength: 0.14,
+    minDirectionalTrades: 20,
+    source: "databento-cme-futures-trades",
+  },
+  CL: {
+    windowMinutes: 45,
+    minDirectionalStrength: 0.13,
+    minDirectionalTrades: 20,
+    source: "databento-cme-futures-trades",
+  },
+  BTC: {
+    windowMinutes: 30,
+    minDirectionalStrength: 0.12,
+    minDirectionalTrades: 30,
+    source: "deribit-btc-futures-trades",
+  },
+};
+
+function normalizeActusDeltaAsset(asset) {
+  const normalized = typeof asset === "string" ? asset.toUpperCase() : "";
+  if (normalized === "XAU" || normalized === "XAU/USD" || normalized === "GC") return "GC";
+  if (normalized === "OIL" || normalized === "CL") return "CL";
+  if (normalized === "BTC" || normalized === "BTC/USD") return "BTC";
+  if (normalized === "NQ") return "NQ";
+  return null;
+}
+
+function buildDeltaSignalPayload({
+  supportedAsset,
+  sourceAvailable,
+  directionalAvailable,
+  netVolume,
+  totalKnownVolume,
+  totalVolume,
+  updatedAt,
+  source,
+}) {
+  const strength = totalKnownVolume > 0 ? round(clamp(Math.abs(netVolume) / totalKnownVolume, 0, 1), 3) : 0;
+  const bias = directionalAvailable ? (netVolume > 0 ? "LONG" : netVolume < 0 ? "SHORT" : "NEUTRAL") : "NEUTRAL";
+  const deltaAvailability = !supportedAsset
+    ? "UNSUPPORTED"
+    : directionalAvailable
+      ? "DIRECTIONAL"
+      : sourceAvailable
+        ? "SOURCE_ONLY"
+        : "UNAVAILABLE";
+  const condition = !sourceAvailable
+    ? "NEUTRAL"
+    : directionalAvailable
+      ? bias === "LONG"
+        ? "ACCUMULATION"
+        : "DISTRIBUTION"
+      : totalKnownVolume > 0 && totalVolume > 0 && totalKnownVolume / totalVolume >= 0.55 && strength <= 0.08
+        ? "ABSORPTION"
+        : "NEUTRAL";
+
+  return {
+    deltaAvailability,
+    deltaSupportedAsset: supportedAsset,
+    deltaSourceAvailable: sourceAvailable,
+    deltaDirectionalAvailable: directionalAvailable,
+    bias,
+    strength,
+    condition,
+    source,
+    updatedAt,
+  };
+}
+
+function buildUnavailableDeltaSignal(asset, source = null) {
+  return {
+    deltaAvailability: "UNAVAILABLE",
+    deltaSupportedAsset: true,
+    deltaSourceAvailable: false,
+    deltaDirectionalAvailable: false,
+    bias: "NEUTRAL",
+    strength: 0,
+    condition: "NEUTRAL",
+    source,
+    updatedAt: null,
+  };
+}
+
+async function buildDatabentoDeltaSignal(asset) {
+  const normalizedAsset = normalizeActusDeltaAsset(asset);
+  const config = normalizedAsset ? DELTA_CONFIGS[normalizedAsset] : null;
+  const future = normalizedAsset ? DATABENTO_FUTURES[normalizedAsset] : null;
+
+  if (!config || !future) {
+    throw new Error(`Unsupported Databento delta asset: ${asset}`);
+  }
+
+  const safeEnd = databentoTradeSafeEndIso();
+  const candidateWindows = Array.from(
+    new Set([config.windowMinutes, Math.max(config.windowMinutes * 3, 180), 1440]),
+  );
+
+  let rows = [];
+  for (const windowMinutes of candidateWindows) {
+    const start = isoMinutesBefore(safeEnd, windowMinutes);
+    const activeRows = await resolveActiveDatabentoFutureRows(normalizedAsset, "trades", start, safeEnd, 40000);
+    if (activeRows?.rows?.length) {
+      rows = activeRows.rows;
+      break;
+    }
+
+    const continuousRows = await databentoHistoricalWithAvailableEndRetry({
+      dataset: "GLBX.MDP3",
+      schema: "trades",
+      symbols: future.symbol,
+      stype_in: "continuous",
+      start,
+      end: safeEnd,
+      encoding: "csv",
+      limit: 40000,
+    }).catch(() => []);
+
+    if (continuousRows.length) {
+      rows = continuousRows;
+      break;
+    }
+  }
+
+  let buyVolume = 0;
+  let sellVolume = 0;
+  let unknownVolume = 0;
+  let directionalTrades = 0;
+
+  rows.forEach((row) => {
+    const size = Number(row.size ?? 0);
+    if (!Number.isFinite(size) || size <= 0) {
+      return;
+    }
+
+    if (row.side === "B") {
+      buyVolume += size;
+      directionalTrades += 1;
+    } else if (row.side === "A") {
+      sellVolume += size;
+      directionalTrades += 1;
+    } else {
+      unknownVolume += size;
+    }
+  });
+
+  const totalKnownVolume = buyVolume + sellVolume;
+  const totalVolume = totalKnownVolume + unknownVolume;
+  const netVolume = buyVolume - sellVolume;
+  const directionalStrength = totalKnownVolume > 0 ? Math.abs(netVolume) / totalKnownVolume : 0;
+  const sourceAvailable = rows.length > 0;
+  const directionalAvailable =
+    sourceAvailable &&
+    directionalTrades >= config.minDirectionalTrades &&
+    totalKnownVolume > 0 &&
+    directionalStrength >= config.minDirectionalStrength;
+
+  return buildDeltaSignalPayload({
+    supportedAsset: true,
+    sourceAvailable,
+    directionalAvailable,
+    netVolume,
+    totalKnownVolume,
+    totalVolume,
+    updatedAt: rows[rows.length - 1]?.ts_event ? normalizeDatabentoTimestamp(rows[rows.length - 1].ts_event) : null,
+    source: config.source,
+  });
+}
+
+async function buildBtcDeltaSignal() {
+  const config = DELTA_CONFIGS.BTC;
+  const result = await deribitPublic("public/get_last_trades_by_currency_and_time", {
+    currency: "BTC",
+    kind: "future",
+    start_timestamp: Date.now() - config.windowMinutes * 60 * 1000,
+    end_timestamp: Date.now(),
+    count: 1000,
+    sorting: "asc",
+  });
+
+  const trades = Array.isArray(result?.trades) ? result.trades : Array.isArray(result) ? result : [];
+  let buyVolume = 0;
+  let sellVolume = 0;
+  let directionalTrades = 0;
+
+  trades.forEach((trade) => {
+    const size = Number(trade.amount ?? trade.contracts ?? 0);
+    if (!Number.isFinite(size) || size <= 0) {
+      return;
+    }
+
+    if (trade.direction === "buy") {
+      buyVolume += size;
+      directionalTrades += 1;
+    } else if (trade.direction === "sell") {
+      sellVolume += size;
+      directionalTrades += 1;
+    }
+  });
+
+  const totalKnownVolume = buyVolume + sellVolume;
+  const netVolume = buyVolume - sellVolume;
+  const directionalStrength = totalKnownVolume > 0 ? Math.abs(netVolume) / totalKnownVolume : 0;
+  const sourceAvailable = trades.length > 0;
+  const directionalAvailable =
+    sourceAvailable &&
+    directionalTrades >= config.minDirectionalTrades &&
+    totalKnownVolume > 0 &&
+    directionalStrength >= config.minDirectionalStrength;
+
+  return buildDeltaSignalPayload({
+    supportedAsset: true,
+    sourceAvailable,
+    directionalAvailable,
+    netVolume,
+    totalKnownVolume,
+    totalVolume: totalKnownVolume,
+    updatedAt:
+      trades.length && Number.isFinite(Number(trades[trades.length - 1]?.timestamp))
+        ? new Date(Number(trades[trades.length - 1].timestamp)).toISOString()
+        : null,
+    source: config.source,
+  });
+}
+
+async function buildActusDeltaSignal(asset) {
+  const normalizedAsset = normalizeActusDeltaAsset(asset);
+  if (normalizedAsset === "BTC") {
+    try {
+      return await buildBtcDeltaSignal();
+    } catch {
+      return buildUnavailableDeltaSignal("BTC", DELTA_CONFIGS.BTC?.source ?? null);
+    }
+  }
+
+  if (normalizedAsset === "NQ" || normalizedAsset === "GC" || normalizedAsset === "CL") {
+    try {
+      return await buildDatabentoDeltaSignal(normalizedAsset);
+    } catch {
+      return buildUnavailableDeltaSignal(normalizedAsset, DELTA_CONFIGS[normalizedAsset]?.source ?? null);
+    }
+  }
+
+  return {
+    deltaAvailability: "UNSUPPORTED",
+    deltaSupportedAsset: false,
+    deltaSourceAvailable: false,
+    deltaDirectionalAvailable: false,
+    bias: "NEUTRAL",
+    strength: 0,
+    condition: "NEUTRAL",
+    source: null,
+    updatedAt: null,
+  };
+}
+
 function normalizeTimeframe(value) {
   if (typeof value === "string" && TIMEFRAME_CONFIGS[value]) {
     return value;
@@ -1126,6 +1627,15 @@ function isoDateDaysAgo(daysAgo) {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() - daysAgo);
   return d.toISOString().slice(0, 10);
+}
+
+function persistOptionChainCache() {
+  try {
+    const payload = Object.fromEntries(optionChainCache.entries());
+    fs.writeFileSync(OPTION_CHAIN_CACHE_FILE, JSON.stringify(payload));
+  } catch {
+    // Persistence is best-effort only.
+  }
 }
 
 async function massiveAggs(ticker, multiplier, timespan, daysBack, limit = 5000) {
@@ -1371,6 +1881,26 @@ app.get("/api/actus/gamma/overlay", async (req, res) => {
   }
 });
 
+app.get("/api/actus/delta/signal", async (req, res) => {
+  try {
+    const asset = typeof req.query.asset === "string" ? req.query.asset.toUpperCase() : "NQ";
+    const signal = await buildActusDeltaSignal(asset);
+
+    res.json({
+      ok: true,
+      asset,
+      signal,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      asset: typeof req.query.asset === "string" ? req.query.asset.toUpperCase() : "UNKNOWN",
+      signal: null,
+      error: error instanceof Error ? error.message : "Delta signal failed",
+    });
+  }
+});
+
 app.get("/api/databento/futures/history", async (req, res) => {
   try {
     const asset = typeof req.query.asset === "string" ? req.query.asset.toUpperCase() : "NQ";
@@ -1491,7 +2021,7 @@ app.get("/api/databento/futures/live", async (req, res) => {
 app.get("/api/databento/options/chain", async (req, res) => {
   try {
     const asset = typeof req.query.asset === "string" ? req.query.asset.toUpperCase() : "NQ";
-    const snapshot = await buildOptionChainSnapshot(asset);
+    const snapshot = await getOptionChainSnapshot(asset);
     res.json({
       ok: true,
       snapshot,

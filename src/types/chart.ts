@@ -4,6 +4,7 @@ export type GammaOverlay = {
   gammaFlip?: number | null;
   callWall?: number | null;
   putWall?: number | null;
+  anchor?: number | null;
   spotReference?: number | null;
   regime?: "PIN" | "EXPANSION" | null;
   bias?: "LONG" | "SHORT" | "NEUTRAL" | null;
