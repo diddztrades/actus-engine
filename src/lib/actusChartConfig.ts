@@ -2,10 +2,11 @@ import { TickMarkType, type Time } from "lightweight-charts";
 import type { TimeframeFilter } from "../types/chart";
 import type { NormalizedFuturesCandle } from "../types/market";
 
-export const ACTUS_VISIBLE_BARS = 160;
-export const ACTUS_HISTORY_BUFFER = 40;
+export const ACTUS_VISIBLE_BARS = 200;
+export const ACTUS_HISTORY_BUFFER = 80;
 export const ACTUS_HISTORY_BARS = ACTUS_VISIBLE_BARS + ACTUS_HISTORY_BUFFER;
-export const ACTUS_CHART_TIMEZONE = "UTC";
+export const ACTUS_CHART_TIMEZONE =
+  typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" : "UTC";
 
 function timeToDate(time: Time) {
   if (typeof time === "number") {

@@ -1,12 +1,12 @@
 import type { MarketTimeframe, NormalizedFuturesCandle } from "../../types/market";
 
-export type DatabentoCoreAsset = "NQ" | "GC" | "CL";
+export type DatabentoCoreAsset = "NQ" | "GC" | "CL" | "6E" | "BTC" | "SOL_CME";
 
 export type DatabentoFutureDefinition = {
   asset: DatabentoCoreAsset;
   symbol: string;
   displayName: string;
-  assetClass: "equity-index" | "metal" | "energy";
+  assetClass: "equity-index" | "metal" | "energy" | "fx" | "crypto";
 };
 
 export type DatabentoHistoryResponse = {

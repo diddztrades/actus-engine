@@ -5,8 +5,17 @@ import type { ActusAction, ActusOpportunityOutput } from "./domain/market/types"
 import { ENV } from "./config/env";
 import { AlertToast } from "./components/AlertToast";
 import { ActusChart } from "./components/ActusChart";
-import { fetchDatabentoFuturesHistory } from "./data/databento/history";
+import { clearDatabentoFuturesHistoryCache, fetchDatabentoFuturesHistory } from "./data/databento/history";
 import type { DatabentoCoreAsset } from "./data/databento/types";
+import { clearActusDeltaSignalCache } from "./data/delta/signal";
+import { clearActusGammaOverlayCache } from "./data/gamma/overlay";
+import {
+  fetchNyOpenFlowHistory,
+  fetchNyOpenFlowSnapshot,
+  type NyOpenFlowAsset,
+  type NyOpenFlowHistorySnapshot,
+  type NyOpenFlowSnapshot,
+} from "./data/session/nyOpenFlow";
 import {
   ACTUS_HISTORY_BUFFER,
   actusHistoryLimit,
@@ -33,6 +42,7 @@ import { Sentry } from "./sentry";
 
 const TIMEFRAME_OPTIONS = ["1m", "5m", "15m", "1h"] as const;
 const VIEW_MODES = ["focus", "deep"] as const;
+const ACTUS_MODE_ASSET_UNIVERSE = ["BTC/USD", "ETH/USD", "SOL/USD", "XAU/USD", "NQ", "CL", "EUR/USD"] as const;
 type ViewMode = (typeof VIEW_MODES)[number];
 type CommandHistoryEntry = {
   id: string;
@@ -47,7 +57,10 @@ type ActusModeSelection = {
   symbol: string;
   timeframe: TimeframeFilter;
   snapshot: ActusOpportunityOutput;
+  solView?: SolActusView;
 };
+
+type SolActusView = "binance-execution" | "cme-structure";
 
 type LiveDatabentoCandle = {
   timestamp?: string;
@@ -60,6 +73,40 @@ type LiveDatabentoCandle = {
   h?: number;
   l?: number;
   c?: number;
+};
+
+type ActusLiveAsset = DatabentoCoreAsset | "BTC" | "ETH" | "SOL";
+
+type ActusModeRenderableAsset = ActusOpportunityOutput & {
+  timeframe: TimeframeFilter;
+  actusSourceKey?: string;
+  actusSourceLabel?: string | null;
+  actusChartSymbol?: string;
+};
+
+type ActusLiveChartSnapshot = {
+  asset: string;
+  timeframe: TimeframeFilter;
+  supportedAsset: boolean;
+  livePrice: number | null;
+  updatedAt: string | null;
+  liveSymbol?: string | null;
+  liveSourceType?: string | null;
+  candleSourceSymbol?: string | null;
+  candleSourceType?: string | null;
+  source: string | null;
+  sourceType: "last-trade" | "quote-mid" | null;
+  candle: LiveDatabentoCandle | null;
+};
+
+type ActusSourceHistoryResponse = {
+  ok: boolean;
+  asset: string;
+  supportedAsset: boolean;
+  timeframe: TimeframeFilter;
+  source: string | null;
+  candles: NormalizedFuturesCandle[];
+  error?: string;
 };
 
 type ActusModeLiveChartState = {
@@ -87,7 +134,11 @@ type ActusReplayHistoryState = {
 
 type ProductPrefs = {
   favorites: string[];
+  alertsEnabled: boolean;
+  executeAlertsEnabled: boolean;
   alertEnabledByAsset: Record<string, boolean>;
+  browserAlertsEnabled: boolean;
+  executeSoundEnabled: boolean;
   preferredTimeframe: TimeframeFilter;
   notesByAsset: Record<string, string>;
   onboardingDismissed: boolean;
@@ -102,9 +153,11 @@ type InAppAlert = {
   body: string;
   tone: InAppAlertTone;
   createdAt: number;
+  sound?: "execute";
 };
 
 type ActusInternalAlertEventType =
+  | "execute-appearance"
   | "bias-change"
   | "confidence-threshold"
   | "condition-change"
@@ -183,6 +236,19 @@ type OpenSetupRecord = {
   everActive: boolean;
 };
 
+type NyOpenFlowMap = Partial<Record<NyOpenFlowAsset, NyOpenFlowSnapshot | null>>;
+type NyOpenFlowHistoryMap = Partial<Record<NyOpenFlowAsset, NyOpenFlowHistorySnapshot[]>>;
+type NyOpenFlowDisplayRow = {
+  item: ActusOpportunityOutput;
+  asset: NyOpenFlowAsset;
+  mode: "current" | "history";
+  label: "Buyer-led" | "Seller-led" | "Balanced" | null;
+  buyVolume: number | null;
+  sellVolume: number | null;
+  balancePct: number | null;
+  subtitle: string;
+};
+
 const PRODUCT_PREFS_KEY = "actus-product-prefs-v1";
 const PRODUCT_HISTORY_KEY = "actus-setup-history-v1";
 const OPEN_POSITIONS_KEY = "actus-open-positions-v1";
@@ -193,7 +259,11 @@ const DEFAULT_REPLAY_SPEED = 1000;
 const REPLAY_SPEEDS = [1400, 900, 500] as const;
 const DEFAULT_PRODUCT_PREFS: ProductPrefs = {
   favorites: [],
+  alertsEnabled: true,
+  executeAlertsEnabled: true,
   alertEnabledByAsset: {},
+  browserAlertsEnabled: false,
+  executeSoundEnabled: false,
   preferredTimeframe: "5m",
   notesByAsset: {},
   onboardingDismissed: false,
@@ -228,6 +298,22 @@ function writeLocalStorage<T>(key: string, value: T) {
   } catch {
     // Ignore persistence failures so the live product keeps running.
   }
+}
+
+function readProductPrefs() {
+  const stored = readLocalStorage(PRODUCT_PREFS_KEY, DEFAULT_PRODUCT_PREFS);
+  return {
+    ...DEFAULT_PRODUCT_PREFS,
+    ...stored,
+    alertEnabledByAsset: {
+      ...DEFAULT_PRODUCT_PREFS.alertEnabledByAsset,
+      ...stored.alertEnabledByAsset,
+    },
+    notesByAsset: {
+      ...DEFAULT_PRODUCT_PREFS.notesByAsset,
+      ...stored.notesByAsset,
+    },
+  };
 }
 
 function tone(action: ActusAction) {
@@ -274,6 +360,35 @@ function updateLabel(mode: string, health: string, lastUpdatedLabel: string) {
 
 function displayViewMode(mode: ViewMode) {
   return mode === "focus" ? "Focus" : "Deep";
+}
+
+function actusSourceQualifier(symbol: string, solView?: SolActusView) {
+  const normalized = symbol.toUpperCase();
+  if ((normalized === "SOL" || normalized === "SOL/USD") && solView === "cme-structure") {
+    return "SOL | CME Structure";
+  }
+  if (normalized === "SOL" || normalized === "SOL/USD") {
+    return "SOL | Binance Execution";
+  }
+  if (normalized === "BTC" || normalized === "BTC/USD") {
+    return "MBT Futures + Deribit Options";
+  }
+  if (normalized === "ETH" || normalized === "ETH/USD") {
+    return "Deribit Perp";
+  }
+  if (normalized === "XAU" || normalized === "XAU/USD" || normalized === "GC") {
+    return "GC Futures";
+  }
+  if (normalized === "OIL" || normalized === "CL") {
+    return "CL Futures";
+  }
+  if (normalized === "NQ") {
+    return "NQ Futures";
+  }
+  if (normalized === "EUR" || normalized === "EUR/USD" || normalized === "EURUSD" || normalized === "6E") {
+    return "6E Futures";
+  }
+  return null;
 }
 
 function setupKey(item: Pick<ActusOpportunityOutput, "symbol" | "timeframe">) {
@@ -391,7 +506,7 @@ function alertPayload(
 }
 
 function isAlertEnabledForAsset(prefs: ProductPrefs, symbol: string) {
-  return prefs.alertEnabledByAsset[symbol] ?? true;
+  return prefs.alertsEnabled && (prefs.alertEnabledByAsset[symbol] ?? true);
 }
 
 function deriveActusAlertBias(item: ActusOpportunityOutput): "LONG" | "SHORT" | "NEUTRAL" {
@@ -486,6 +601,7 @@ function buildInternalAlertEvents(
 }
 
 function internalAlertEventLabel(eventType: ActusInternalAlertEventType) {
+  if (eventType === "execute-appearance") return "Execute Live";
   if (eventType === "bias-change") return "Bias Shift";
   if (eventType === "confidence-threshold") return "Confidence Shift";
   if (eventType === "condition-change") return "Condition Shift";
@@ -494,6 +610,7 @@ function internalAlertEventLabel(eventType: ActusInternalAlertEventType) {
 }
 
 function internalAlertEventTone(eventType: ActusInternalAlertEventType) {
+  if (eventType === "execute-appearance") return tone("execute");
   if (eventType === "delta-directional") return tone("execute");
   if (eventType === "positioning-change") return { text: "#67b7ff", bg: "rgba(103,183,255,0.12)", border: "rgba(103,183,255,0.28)" };
   if (eventType === "confidence-threshold") return tone("wait");
@@ -525,10 +642,106 @@ function internalAlertSummary(event: ActusInternalAlertEvent) {
   if (event.eventType === "positioning-change" && previous) {
     return `${previous.positioningType ?? "NONE"} to ${next.positioningType ?? "NONE"}`;
   }
+  if (event.eventType === "execute-appearance") {
+    return next.condition === "BREAKOUT" ? "Execute lane opened on confirmed breakout" : "Execute lane opened";
+  }
   if (event.eventType === "delta-directional") {
     return next.deltaBias ? `${next.deltaBias} flow confirmed` : "Directional flow confirmed";
   }
   return next.symbol;
+}
+
+function browserNotificationsSupported() {
+  return typeof window !== "undefined" && "Notification" in window;
+}
+
+function currentBrowserNotificationPermission(): NotificationPermission | "unsupported" {
+  if (!browserNotificationsSupported()) {
+    return "unsupported";
+  }
+  return window.Notification.permission;
+}
+
+function shouldDeliverBrowserAlert() {
+  if (typeof document === "undefined") {
+    return false;
+  }
+  return document.visibilityState !== "visible" || !document.hasFocus();
+}
+
+function buildBrowserNotificationFromInternalEvent(event: ActusInternalAlertEvent) {
+  const eventLabel = internalAlertEventLabel(event.eventType);
+  const summary = internalAlertSummary(event);
+  return {
+    fingerprint: `internal:${event.asset}:${event.eventType}:${summary}`,
+    title: `${event.asset} • ${eventLabel}`,
+    body: summary,
+    tag: `actus-internal-${event.asset}-${event.eventType}`,
+  };
+}
+
+function buildBrowserNotificationFromInAppAlert(alert: InAppAlert) {
+  return {
+    fingerprint: `execution:${alert.symbol}:${alert.title}:${alert.body}`,
+    title: `${alert.symbol} • Execution Alert`,
+    body: `${alert.title}: ${alert.body}`,
+    tag: `actus-execution-${alert.symbol}`,
+  };
+}
+
+let executeAlertAudioContext: AudioContext | null = null;
+
+function getExecuteAlertAudioContext() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const AudioContextCtor = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextCtor) {
+    return null;
+  }
+
+  if (!executeAlertAudioContext || executeAlertAudioContext.state === "closed") {
+    executeAlertAudioContext = new AudioContextCtor();
+  }
+
+  return executeAlertAudioContext;
+}
+
+async function playExecuteAlertSound() {
+  const context = getExecuteAlertAudioContext();
+  if (!context) {
+    return false;
+  }
+
+  if (context.state === "suspended") {
+    try {
+      await context.resume();
+    } catch {
+      return false;
+    }
+  }
+
+  if (context.state !== "running") {
+    return false;
+  }
+
+  const now = context.currentTime;
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+
+  oscillator.type = "sine";
+  oscillator.frequency.setValueAtTime(920, now);
+  oscillator.frequency.exponentialRampToValueAtTime(1180, now + 0.18);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.2, now + 0.018);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.24);
+  return true;
 }
 
 function replayOutcomeTone(outcome: SetupOutcome) {
@@ -705,6 +918,194 @@ function compactMetricCard(label: string, value: string, detail?: string, accent
   );
 }
 
+function mapSymbolToNyOpenFlowAsset(symbol: string): NyOpenFlowAsset | null {
+  const normalized = typeof symbol === "string" ? symbol.toUpperCase() : "";
+  if (normalized === "NQ") return "NQ";
+  if (normalized === "CL" || normalized === "OIL") return "CL";
+  if (normalized === "XAU" || normalized === "XAU/USD" || normalized === "GC") return "GC";
+  if (normalized === "EUR/USD" || normalized === "EURUSD" || normalized === "6E") return "6E";
+  if (normalized === "BTC" || normalized === "BTC/USD" || normalized === "MBT") return "BTC";
+  return null;
+}
+
+function formatNyOpenFlowVolume(value: number | null) {
+  if (!Number.isFinite(value ?? null)) return "n/a";
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value ?? 0);
+}
+
+function formatNyOpenFlowPercent(balancePct: number | null) {
+  if (!Number.isFinite(balancePct ?? null)) return "n/a";
+  const pct = Math.round((balancePct ?? 0) * 100);
+  return `${pct > 0 ? "+" : ""}${pct}%`;
+}
+
+function nyOpenFlowAccent(flow: { label: "Buyer-led" | "Seller-led" | "Balanced" | null; balancePct?: number | null } | null) {
+  if (flow?.label === "Buyer-led") return "#45ffb5";
+  if (flow?.label === "Seller-led") return "#ff8ea8";
+  return "#d7e1f4";
+}
+
+function compactNyOpenFlowLabel(flow: NyOpenFlowSnapshot | null) {
+  if (!flow?.ready || !flow.label) {
+    return null;
+  }
+  if (flow.label === "Balanced") {
+    return "NY Open 30m Flow: Balanced";
+  }
+  return `NY Open 30m Flow: ${formatNyOpenFlowPercent(flow.balancePct)} ${flow.label === "Buyer-led" ? "Buy" : "Sell"}`;
+}
+
+function deepNyOpenFlowSection(
+  items: ActusOpportunityOutput[],
+  nyOpenFlowByAsset: NyOpenFlowMap,
+  nyOpenFlowHistoryByAsset: NyOpenFlowHistoryMap,
+) {
+  const historyRows = items
+    .map((item) => {
+      const asset = mapSymbolToNyOpenFlowAsset(item.symbol);
+      if (!asset) return null;
+      const history = (nyOpenFlowHistoryByAsset[asset] ?? []).slice(0, 5);
+      return history.length ? { item, asset, history } : null;
+    })
+    .filter(
+      (row): row is { item: ActusOpportunityOutput; asset: NyOpenFlowAsset; history: NyOpenFlowHistorySnapshot[] } =>
+        Boolean(row),
+    );
+
+  const displayRows = items.reduce<NyOpenFlowDisplayRow[]>((rows, item) => {
+      const asset = mapSymbolToNyOpenFlowAsset(item.symbol);
+      if (!asset) return rows;
+      const flow = nyOpenFlowByAsset[asset] ?? null;
+      if (flow?.ready) {
+        rows.push({
+          item,
+          asset,
+          mode: "current" as const,
+          label: flow.label,
+          buyVolume: flow.buyVolume,
+          sellVolume: flow.sellVolume,
+          balancePct: flow.balancePct,
+          subtitle: "13:30-14:00 UTC",
+        });
+        return rows;
+      }
+      const latestHistory = (nyOpenFlowHistoryByAsset[asset] ?? [])[0] ?? null;
+      if (!latestHistory) {
+        return rows;
+      }
+      rows.push({
+        item,
+        asset,
+        mode: "history" as const,
+        label: latestHistory.label,
+        buyVolume: latestHistory.buyVolume,
+        sellVolume: latestHistory.sellVolume,
+        balancePct: latestHistory.balancePct,
+        subtitle: `Last completed ${latestHistory.date}`,
+      });
+      return rows;
+    }, []);
+
+  if (!displayRows.length && !historyRows.length) {
+    return null;
+  }
+
+  return (
+    <section style={{ background: "linear-gradient(145deg, rgba(10,17,31,0.98), rgba(7,12,22,0.96))", border: "1px solid rgba(132,151,186,0.16)", borderRadius: 26, padding: 18, boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)", display: "grid", gap: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>NY Open 30m Flow Balance</div>
+          <div style={{ marginTop: 6, fontSize: 14, color: "#9aabc8", lineHeight: 1.5 }}>
+            Display-only session context from aggressive buy/sell volume between 13:30 and 14:00 UTC.
+          </div>
+        </div>
+        {badge(`${Math.max(displayRows.length, historyRows.length)} assets`, "#d7e1f4", "rgba(255,255,255,0.03)", "rgba(142,160,191,0.14)")}
+      </div>
+      {displayRows.length ? (
+        <div style={{ display: "grid", gap: 10 }}>
+          {displayRows.map(({ item, mode, label, buyVolume, sellVolume, balancePct, subtitle }) => (
+            <div key={`ny-open-flow-${item.symbol}`} style={{ padding: "13px 14px", background: "linear-gradient(180deg, rgba(12,17,30,0.74), rgba(6,9,17,0.88))", borderRadius: 16, border: "1px solid rgba(118,138,176,0.12)", display: "grid", gap: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: "#f4f7fb" }}>{item.symbol}</div>
+                  {badge(label ?? "Balanced", nyOpenFlowAccent({ label, balancePct }), "rgba(255,255,255,0.03)", "rgba(142,160,191,0.18)")}
+                  {mode === "history"
+                    ? badge("Last Completed", "#9fb0cb", "rgba(255,255,255,0.03)", "rgba(142,160,191,0.14)")
+                    : null}
+                </div>
+                <div style={{ fontSize: 11, color: "#8ea0bf", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                  {subtitle}
+                </div>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
+                {metricCard("Buy Volume", formatNyOpenFlowVolume(buyVolume), "Aggressive buys", "#45ffb5")}
+                {metricCard("Sell Volume", formatNyOpenFlowVolume(sellVolume), "Aggressive sells", "#ff8ea8")}
+                {metricCard("Net %", formatNyOpenFlowPercent(balancePct), "Buy - sell / total", nyOpenFlowAccent({ label, balancePct }))}
+                {metricCard("Flow", label ?? "Balanced", item.displayName, nyOpenFlowAccent({ label, balancePct }))}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ padding: "13px 14px", background: "linear-gradient(180deg, rgba(12,17,30,0.74), rgba(6,9,17,0.88))", borderRadius: 16, border: "1px solid rgba(118,138,176,0.12)", fontSize: 14, color: "#9aabc8", lineHeight: 1.5 }}>
+          Current-session NY Open Flow will appear after the 13:30-14:00 UTC window completes. Historical records remain visible below.
+        </div>
+      )}
+      {historyRows.length ? (
+        <div style={{ display: "grid", gap: 10 }}>
+          <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase", paddingTop: 4 }}>Recent NY Open Flow History</div>
+          <div style={{ display: "grid", gap: 10 }}>
+            {historyRows.map(({ item, asset, history }) => (
+              <div
+                key={`ny-open-flow-history-${item.symbol}`}
+                style={{
+                  padding: "13px 14px",
+                  background: "linear-gradient(180deg, rgba(12,17,30,0.74), rgba(6,9,17,0.88))",
+                  borderRadius: 16,
+                  border: "1px solid rgba(118,138,176,0.12)",
+                  display: "grid",
+                  gap: 8,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: "#f4f7fb" }}>{item.symbol}</div>
+                    {badge("History", "#d7e1f4", "rgba(255,255,255,0.03)", "rgba(142,160,191,0.14)")}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#8ea0bf", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                    Last {history.length} sessions
+                  </div>
+                </div>
+                <div style={{ display: "grid", gap: 6 }}>
+                  {history.map((entry) => (
+                    <div
+                      key={`${asset}-${entry.date}`}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(0, 110px) minmax(0, 1fr) auto",
+                        gap: 10,
+                        alignItems: "center",
+                        padding: "9px 10px",
+                        borderRadius: 12,
+                        background: "rgba(255,255,255,0.018)",
+                        border: "1px solid rgba(142,160,191,0.08)",
+                      }}
+                    >
+                      <div style={{ fontSize: 12, color: "#d7e1f4", fontWeight: 600 }}>{entry.date}</div>
+                      <div style={{ fontSize: 12, color: "#9aabc8" }}>{entry.label}</div>
+                      <div style={{ fontSize: 12, color: nyOpenFlowAccent(entry), fontWeight: 700 }}>{formatNyOpenFlowPercent(entry.balancePct)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function ghostButton(text: string, onClick: () => void, toneColor = "#8ea0bf") {
   return (
     <button
@@ -772,7 +1173,12 @@ function formatStateTimer(minutes: number, nowTick: number) {
   return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 
-function resolveActusLiveAsset(item: ActusOpportunityOutput | null) {
+function isSolActusSymbol(symbol: string | null | undefined) {
+  const normalized = symbol?.toUpperCase() ?? "";
+  return normalized === "SOL" || normalized === "SOL/USD";
+}
+
+function resolveActusLiveAsset(item: Pick<ActusOpportunityOutput, "symbol" | "displayName"> | null, solView?: SolActusView) {
   if (!item) return null;
   const normalizedSymbol = item.symbol.toUpperCase();
   const normalizedName = item.displayName.toUpperCase();
@@ -780,8 +1186,42 @@ function resolveActusLiveAsset(item: ActusOpportunityOutput | null) {
   if (normalizedSymbol === "NQ") return "NQ";
   if (normalizedSymbol === "CL" || normalizedSymbol === "OIL" || normalizedName.includes("CRUDE")) return "CL";
   if (normalizedSymbol === "GC" || normalizedSymbol === "XAU" || normalizedSymbol === "XAUUSD" || normalizedName.includes("GOLD")) return "GC";
+  if (normalizedSymbol === "EUR/USD" || normalizedSymbol === "EURUSD" || normalizedName.includes("EURO")) return "6E";
+  if (normalizedSymbol === "BTC" || normalizedSymbol === "BTC/USD") return "BTC";
+  if (normalizedSymbol === "ETH" || normalizedSymbol === "ETH/USD") return "ETH";
+  if (normalizedSymbol === "SOL" || normalizedSymbol === "SOL/USD") return solView === "cme-structure" ? "SOL_CME" : "SOL";
 
   return null;
+}
+
+function normalizeSolActusView(selection: ActusModeSelection | null | undefined): SolActusView {
+  return selection?.solView === "cme-structure" ? "cme-structure" : "binance-execution";
+}
+
+function resolveActusModeSourceKey(item: Pick<ActusOpportunityOutput, "symbol" | "displayName"> | null, solView?: SolActusView) {
+  if (!item) return null;
+  return resolveActusLiveAsset(item, solView);
+}
+
+function resolveActusModeChartSymbol(item: Pick<ActusOpportunityOutput, "symbol"> | null, solView?: SolActusView) {
+  if (!item) return "";
+  return isSolActusSymbol(item.symbol) && solView === "cme-structure" ? "SOL_CME" : item.symbol;
+}
+
+function actusModeSelectionSymbolCandidates(symbol: string) {
+  const normalized = typeof symbol === "string" ? symbol.toUpperCase() : "";
+  if (normalized === "BTC" || normalized === "BTC/USD" || normalized === "MBT") return ["BTC/USD", "BTC"];
+  if (normalized === "ETH" || normalized === "ETH/USD") return ["ETH/USD", "ETH"];
+  if (normalized === "SOL" || normalized === "SOL/USD") return ["SOL/USD", "SOL"];
+  if (normalized === "XAU" || normalized === "XAU/USD" || normalized === "GC") return ["XAU/USD", "XAU", "GC"];
+  if (normalized === "CL" || normalized === "OIL") return ["CL", "OIL"];
+  if (normalized === "EUR" || normalized === "EUR/USD" || normalized === "EURUSD" || normalized === "6E") return ["EUR/USD", "EUR", "6E"];
+  if (normalized === "NQ") return ["NQ"];
+  return [symbol];
+}
+
+function isDatabentoLiveAsset(asset: ActusLiveAsset | null): asset is DatabentoCoreAsset {
+  return asset === "NQ" || asset === "GC" || asset === "CL" || asset === "6E" || asset === "BTC" || asset === "SOL_CME";
 }
 
 function buildReplaySafeDeltaSignal(symbol: string): DeltaSignal {
@@ -794,8 +1234,18 @@ function buildReplaySafeDeltaSignal(symbol: string): DeltaSignal {
     normalized === "XAUUSD" ||
     normalized === "CL" ||
     normalized === "OIL" ||
+    normalized === "EUR" ||
+    normalized === "EUR/USD" ||
+    normalized === "EURUSD" ||
+    normalized === "6E" ||
     normalized === "BTC" ||
-    normalized === "BTC/USD";
+    normalized === "BTC/USD" ||
+    normalized === "ETH" ||
+    normalized === "ETH/USD" ||
+    normalized === "SOL_CME" ||
+    normalized === "SOL-CME" ||
+    normalized === "SOL" ||
+    normalized === "SOL/USD";
 
   return {
     deltaAvailability: supported ? "UNAVAILABLE" : "UNSUPPORTED",
@@ -816,12 +1266,7 @@ function replaySpeedLabel(speed: number) {
   return "1x";
 }
 
-function readLiveCandleClose(candle: LiveDatabentoCandle) {
-  const value = candle.close ?? candle.c ?? candle.open ?? candle.o ?? null;
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function normalizeLiveCandle(candle: LiveDatabentoCandle, asset: DatabentoCoreAsset, timeframe: TimeframeFilter): NormalizedFuturesCandle | null {
+function normalizeLiveCandle(candle: LiveDatabentoCandle, asset: ActusLiveAsset, timeframe: TimeframeFilter): NormalizedFuturesCandle | null {
   const open = candle.open ?? candle.o ?? null;
   const high = candle.high ?? candle.h ?? null;
   const low = candle.low ?? candle.l ?? null;
@@ -857,15 +1302,15 @@ function normalizeLiveCandle(candle: LiveDatabentoCandle, asset: DatabentoCoreAs
 
 function actusSafeHistoryEndIso(timeframe: TimeframeFilter) {
   const boundary = closedCandleBoundaryMs(timeframe, Date.now());
-  const bufferedEnd = boundary - ACTUS_HISTORY_BUFFER * actusTimeframeDurationMs(timeframe);
-  return new Date(bufferedEnd).toISOString();
+  return new Date(Math.max(boundary - 1, 0)).toISOString();
 }
 
 function actusTargetBars(timeframe: TimeframeFilter) {
-  if (timeframe === "1m") return 150;
-  if (timeframe === "5m") return 120;
-  if (timeframe === "15m") return 100;
-  return 80;
+  const minimumHistory = minimumActusHistoryCandles();
+  if (timeframe === "1m") return Math.max(minimumHistory + 40, 240);
+  if (timeframe === "5m") return Math.max(minimumHistory + 20, 220);
+  if (timeframe === "15m") return Math.max(minimumHistory, 200);
+  return Math.max(minimumHistory - 20, 180);
 }
 
 function actusReplayHistoryLimit(timeframe: TimeframeFilter) {
@@ -875,17 +1320,15 @@ function actusReplayHistoryLimit(timeframe: TimeframeFilter) {
   return 180;
 }
 
-function actusTraceDepthKey(symbol: string | null | undefined, timeframe: TimeframeFilter | null | undefined) {
-  if (!symbol || !timeframe) return null;
-  const normalized = symbol.toUpperCase();
-  if (normalized === "XAU" || normalized === "XAU/USD" || normalized === "GC") return `XAU ${timeframe}`;
-  if (normalized === "NQ") return `NQ ${timeframe}`;
-  if (normalized === "BTC" || normalized === "BTC/USD") return `BTC ${timeframe}`;
-  return null;
-}
-
 function actusLookbackWindowHours(asset: DatabentoCoreAsset, timeframe: TimeframeFilter) {
-  if (asset === "GC" && timeframe === "1m") return [24, 48, 96, 168];
+  if (asset === "GC" && timeframe === "1m") return [48, 96, 168, 336];
+  if (asset === "GC" && timeframe === "5m") return [96, 168, 336, 504];
+  if (asset === "GC" && timeframe === "15m") return [240, 480, 720, 1440];
+  if (asset === "GC" && timeframe === "1h") return [1440, 2160, 4320, 6480];
+  if (asset === "6E" && timeframe === "1m") return [12, 24, 48, 96];
+  if (asset === "6E" && timeframe === "5m") return [72, 144, 240, 480];
+  if (asset === "6E" && timeframe === "15m") return [168, 336, 504, 1008];
+  if (asset === "6E" && timeframe === "1h") return [720, 1440, 2160, 4320];
   if (timeframe === "1m") return [6, 12, 24, 48];
   if (timeframe === "5m") return [48, 96, 168, 336];
   if (timeframe === "15m") return [120, 240, 480, 720];
@@ -894,6 +1337,7 @@ function actusLookbackWindowHours(asset: DatabentoCoreAsset, timeframe: Timefram
 
 function actusSparseFeedWindowMultiplier(asset: DatabentoCoreAsset) {
   if (asset === "GC") return 1.5;
+  if (asset === "6E") return 1.2;
   return 1;
 }
 
@@ -908,8 +1352,8 @@ function sortActusCandles(candles: NormalizedFuturesCandle[]) {
     .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
 }
 
-function supportsActusIntradayDensification(asset: DatabentoCoreAsset, timeframe: TimeframeFilter) {
-  return (asset === "NQ" || asset === "GC" || asset === "CL") && (timeframe === "1m" || timeframe === "5m" || timeframe === "15m");
+function supportsActusIntradayDensification(asset: ActusLiveAsset, timeframe: TimeframeFilter) {
+  return (asset === "NQ" || asset === "GC" || asset === "CL" || asset === "6E") && (timeframe === "1m" || timeframe === "5m" || timeframe === "15m");
 }
 
 function actusMaxFlatFillGapBuckets(timeframe: TimeframeFilter) {
@@ -1028,7 +1472,7 @@ function densifySparseActusCandles(
 function mergeActusLiveCandleSeries(
   currentCandles: NormalizedFuturesCandle[] | null,
   incoming: NormalizedFuturesCandle,
-  asset: DatabentoCoreAsset,
+  asset: ActusLiveAsset,
   timeframe: TimeframeFilter,
   historyLimit: number,
 ) {
@@ -1068,45 +1512,52 @@ function mergeActusLiveCandleSeries(
   return merged.slice(-historyLimit);
 }
 
-function summarizeActusCandleSemantics(candles: NormalizedFuturesCandle[]) {
-  if (!candles.length) {
-    return {
-      count: 0,
-      firstTimestamp: null,
-      lastTimestamp: null,
-      spanHours: 0,
-      averageBarsPerHour: 0,
-      gapCount: 0,
-      maxGapMinutes: 0,
-    };
+function evolveActusActiveCandleFromLivePrice(
+  currentCandles: NormalizedFuturesCandle[] | null,
+  args: {
+    asset: ActusLiveAsset;
+    timeframe: TimeframeFilter;
+    livePrice: number | null;
+    updatedAt: string | null;
+  },
+) {
+  const { asset, timeframe, livePrice, updatedAt } = args;
+  if (!currentCandles?.length || typeof livePrice !== "number" || !Number.isFinite(livePrice) || !updatedAt) {
+    return currentCandles;
   }
 
-  const sorted = sortActusCandles(candles);
-  const firstMs = Date.parse(sorted[0].timestamp);
-  const lastMs = Date.parse(sorted[sorted.length - 1].timestamp);
-  const spanHours = firstMs === lastMs ? 0 : (lastMs - firstMs) / 3_600_000;
-  let missingMinuteBuckets = 0;
-  let maxGapMinutes = 1;
-
-  for (let index = 1; index < sorted.length; index += 1) {
-    const gapMinutes = Math.round((Date.parse(sorted[index].timestamp) - Date.parse(sorted[index - 1].timestamp)) / 60_000);
-    if (gapMinutes > 1) {
-      missingMinuteBuckets += gapMinutes - 1;
-    }
-    if (gapMinutes > maxGapMinutes) {
-      maxGapMinutes = gapMinutes;
-    }
+  const updatedAtMs = Date.parse(updatedAt);
+  if (!Number.isFinite(updatedAtMs)) {
+    return currentCandles;
   }
 
-  return {
-    count: sorted.length,
-    firstTimestamp: sorted[0].timestamp,
-    lastTimestamp: sorted[sorted.length - 1].timestamp,
-    spanHours,
-    averageBarsPerHour: spanHours > 0 ? sorted.length / spanHours : sorted.length,
-    gapCount: missingMinuteBuckets,
-    maxGapMinutes,
+  const bucketStartMs = closedCandleBoundaryMs(timeframe, updatedAtMs);
+  const lastIndex = currentCandles.length - 1;
+  const lastCandle = currentCandles[lastIndex];
+  const lastTimestampMs = Date.parse(lastCandle.timestamp);
+  if (!Number.isFinite(lastTimestampMs) || lastTimestampMs !== bucketStartMs) {
+    return currentCandles;
+  }
+
+  const nextClose = livePrice;
+  const nextCandle: NormalizedFuturesCandle = {
+    ...lastCandle,
+    asset,
+    symbol: asset,
+    close: nextClose,
+    high: Math.max(lastCandle.high, nextClose),
+    low: Math.min(lastCandle.low, nextClose),
   };
+
+  if (
+    nextCandle.close === lastCandle.close &&
+    nextCandle.high === lastCandle.high &&
+    nextCandle.low === lastCandle.low
+  ) {
+    return currentCandles;
+  }
+
+  return [...currentCandles.slice(0, lastIndex), nextCandle];
 }
 
 async function ensureActusCandleDepth(args: {
@@ -1116,10 +1567,10 @@ async function ensureActusCandleDepth(args: {
   historyLimit: number;
 }) {
   const { asset, displaySymbol, timeframe, historyLimit } = args;
+  void displaySymbol;
   const targetBars = actusTargetBars(timeframe);
   const end = actusSafeHistoryEndIso(timeframe);
   const requestLimit = Math.max(historyLimit, targetBars);
-  const traceKey = actusTraceDepthKey(displaySymbol, timeframe);
   const sparseFeedMultiplier = actusSparseFeedWindowMultiplier(asset);
   const attempts: Array<{ stage: string; count: number; first: string | null; last: string | null }> = [];
 
@@ -1159,35 +1610,13 @@ async function ensureActusCandleDepth(args: {
   }
 
   const finalCandles = best.slice(-historyLimit);
-  const semanticCandles = densifySparseActusCandles(finalCandles, asset, timeframe, targetBars);
-
-  if (traceKey) {
-    console.info("[ACTUS][DEPTH TRACE]", {
-      asset: traceKey,
-      targetBars,
-      firstRequestCount: attempts[0]?.count ?? 0,
-      retryCounts: attempts.slice(1).map((attempt) => ({ stage: attempt.stage, count: attempt.count })),
-      finalCountHandedToActus: semanticCandles.length,
-      firstCandleTimestamp: semanticCandles[0]?.timestamp ?? null,
-      lastCandleTimestamp: semanticCandles[semanticCandles.length - 1]?.timestamp ?? null,
-    });
-  }
-
-  if (traceKey && timeframe === "1m") {
-    const rawSemantics = summarizeActusCandleSemantics(finalCandles);
-    const densifiedSemantics = summarizeActusCandleSemantics(semanticCandles);
-    console.info(`[ACTUS][${traceKey}][SEMANTICS]`, {
-      raw: rawSemantics,
-      densified: densifiedSemantics,
-      sourceProvidesOnlyTradedIntervals: rawSemantics.gapCount > 0,
-    });
-  }
+  const semanticCandles = densifySparseActusCandles(finalCandles, asset, timeframe, historyLimit);
 
   return semanticCandles;
 }
 
 function buildSparklineFallbackCandles(item: ActusOpportunityOutput): NormalizedFuturesCandle[] | null {
-  if (!item.sparkline.length) {
+  if (!hasRenderableActusSparkline(item.sparkline)) {
     return null;
   }
 
@@ -1215,12 +1644,47 @@ function buildSparklineFallbackCandles(item: ActusOpportunityOutput): Normalized
   });
 }
 
+function supportsSparklineBootstrap(asset: ActusLiveAsset | null) {
+  return asset !== "ETH" && asset !== "SOL" && asset !== "SOL_CME";
+}
+
+async function fetchActusSourceHistory(args: {
+  asset: Extract<ActusLiveAsset, "ETH" | "SOL">;
+  timeframe: TimeframeFilter;
+  limit: number;
+}) {
+  const url = new URL(`${API_BASE}/api/actus/source-history`);
+  url.searchParams.set("asset", args.asset);
+  url.searchParams.set("timeframe", args.timeframe);
+  url.searchParams.set("limit", String(args.limit));
+  const response = await fetch(url.toString());
+  const payload = (await response.json()) as ActusSourceHistoryResponse;
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error ?? "ACTUS source history request failed");
+  }
+  return sortActusCandles((payload.candles ?? []).filter((candle) => Number.isFinite(Date.parse(candle.timestamp))));
+}
+
 function hasRenderableActusCandles(candles: NormalizedFuturesCandle[] | null | undefined) {
-  return Boolean(candles && candles.length >= 8);
+  return Boolean(
+    candles &&
+      candles.length >= 8 &&
+      candles.every(
+        (candle) =>
+          Number.isFinite(candle.open) &&
+          Number.isFinite(candle.high) &&
+          Number.isFinite(candle.low) &&
+          Number.isFinite(candle.close) &&
+          candle.open > 0 &&
+          candle.high > 0 &&
+          candle.low > 0 &&
+          candle.close > 0,
+      ),
+  );
 }
 
 function hasRenderableActusSparkline(points: number[] | null | undefined): points is number[] {
-  return Boolean(points && points.length >= 8);
+  return Boolean(points && points.length >= 8 && points.every((point) => Number.isFinite(point)) && points.some((point) => point > 0));
 }
 
 function displayLocation(location: string) {
@@ -1362,6 +1826,148 @@ function positioningTypeTone(type: ActusPositioning["positioningType"]) {
   return "#9fb0cb";
 }
 
+function hasFiniteGammaExposureValue(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function gammaExposureState(positioning: ActusPositioning | null, gammaOverlay: GammaOverlay | null) {
+  const sourceAvailable = Boolean(gammaOverlay?.source) || Boolean(positioning?.gammaSourceAvailable);
+  const upper = positioning?.levels?.upper ?? gammaOverlay?.callWall ?? null;
+  const lower = positioning?.levels?.lower ?? gammaOverlay?.putWall ?? null;
+  const anchor = positioning?.levels?.anchor ?? gammaOverlay?.anchor ?? gammaOverlay?.gammaFlip ?? null;
+  const gammaFlip = gammaOverlay?.gammaFlip ?? null;
+  const levelsAvailable =
+    Boolean(positioning?.gammaLevelsAvailable) ||
+    hasFiniteGammaExposureValue(upper) ||
+    hasFiniteGammaExposureValue(lower) ||
+    hasFiniteGammaExposureValue(anchor) ||
+    hasFiniteGammaExposureValue(gammaFlip);
+  const directionalAvailable =
+    Boolean(positioning?.gammaDirectionalAvailable) || hasFiniteGammaExposureValue(gammaFlip);
+
+  if (sourceAvailable && levelsAvailable && directionalAvailable) {
+    return {
+      label: "Gamma: Directional",
+      color: "#d7ffea",
+      background: "rgba(69,255,181,0.12)",
+      border: "rgba(69,255,181,0.3)",
+      summary: "Real gamma exposure is visible, and directional levels are available to the decision layer.",
+    };
+  }
+
+  if (sourceAvailable && levelsAvailable) {
+    return {
+      label: "Gamma: Levels Active",
+      color: "#d8e7ff",
+      background: "rgba(103,183,255,0.11)",
+      border: "rgba(103,183,255,0.24)",
+      summary: "Real gamma exposure is visible, but the structure is not directional enough for an active edge.",
+    };
+  }
+
+  if (sourceAvailable) {
+    return {
+      label: "Gamma: Source Only",
+      color: "#d8e7ff",
+      background: "rgba(103,183,255,0.08)",
+      border: "rgba(103,183,255,0.2)",
+      summary: "A real gamma source is active, but no honest levels are resolved yet.",
+    };
+  }
+
+  if (positioning?.positioningType === "POSITIONING_PROXY") {
+    return {
+      label: "Positioning: Proxy",
+      color: "#c8dcff",
+      background: "rgba(103,183,255,0.09)",
+      border: "rgba(103,183,255,0.22)",
+      summary: "No real gamma levels are resolved, so proxy positioning is guiding the decision surface.",
+    };
+  }
+
+  return {
+    label: "Positioning: Unavailable",
+    color: "#b8c7df",
+    background: "rgba(255,255,255,0.035)",
+    border: "rgba(142,160,191,0.16)",
+    summary: "No honest options positioning source is available right now.",
+  };
+}
+
+function gammaExposureSourceLabel(gammaOverlay: GammaOverlay | null) {
+  if (!gammaOverlay?.source) return "Not resolved";
+  if (gammaOverlay.source === "deribit-btc-option-chain") return "Deribit BTC";
+  if (gammaOverlay.source === "deribit-eth-option-chain") return "Deribit ETH";
+  if (gammaOverlay.source === "deribit-sol-option-chain") return "Deribit SOL";
+  if (gammaOverlay.source === "nq-option-chain" || gammaOverlay.source === "databento-nq-option-chain") return "Databento NQ";
+  if (gammaOverlay.source === "6e-option-chain") return "Databento 6E";
+  if (gammaOverlay.source === "gc-option-chain") return "Databento GC";
+  if (gammaOverlay.source === "cl-option-chain") return "Databento CL";
+  return gammaOverlay.source;
+}
+
+function gammaExposureDetail(positioning: ActusPositioning | null, gammaOverlay: GammaOverlay | null) {
+  const upper = positioning?.levels?.upper ?? gammaOverlay?.callWall ?? null;
+  const lower = positioning?.levels?.lower ?? gammaOverlay?.putWall ?? null;
+  const anchor = positioning?.levels?.anchor ?? gammaOverlay?.anchor ?? gammaOverlay?.gammaFlip ?? null;
+  const gammaFlip = gammaOverlay?.gammaFlip ?? null;
+
+  if (hasFiniteGammaExposureValue(upper) && hasFiniteGammaExposureValue(lower) && hasFiniteGammaExposureValue(gammaFlip)) {
+    return "Walls and flip resolved";
+  }
+  if (hasFiniteGammaExposureValue(upper) || hasFiniteGammaExposureValue(lower) || hasFiniteGammaExposureValue(anchor)) {
+    return "Levels visible, edge still incomplete";
+  }
+  if (gammaOverlay?.source) {
+    return "Source active, structure still sparse";
+  }
+  return "Source unavailable";
+}
+
+function actionabilityState(positioning: ActusPositioning | null) {
+  const confidence = positioning?.confidence ?? 0;
+  const directional = positioning?.bias && positioning.bias !== "NEUTRAL";
+  const condition = positioning?.condition ?? "MEAN_REVERSION";
+
+  if (condition === "TRAP") {
+    return {
+      label: "Judgment: Defensive",
+      color: "#ffd6dd",
+      background: "rgba(255,142,168,0.11)",
+      border: "rgba(255,142,168,0.24)",
+      summary: "ACTUS sees structure, but the current condition is defensive rather than tradeable.",
+    };
+  }
+
+  if (directional && confidence >= 0.6) {
+    return {
+      label: "Judgment: Strong",
+      color: "#d7ffea",
+      background: "rgba(69,255,181,0.12)",
+      border: "rgba(69,255,181,0.28)",
+      summary: "Actionability is strong enough to matter now, separate from the exposure map beneath it.",
+    };
+  }
+
+  if (confidence >= 0.35) {
+    return {
+      label: "Judgment: Building",
+      color: "#d8e7ff",
+      background: "rgba(103,183,255,0.11)",
+      border: "rgba(103,183,255,0.24)",
+      summary: "Exposure is present, but ACTUS still treats the setup as developing rather than fully trade-ready.",
+    };
+  }
+
+  return {
+    label: "Judgment: Weak",
+    color: "#f2e3bf",
+    background: "rgba(255,202,112,0.1)",
+    border: "rgba(255,202,112,0.2)",
+    summary: "Exposure may exist, but current decision quality is still weak or incomplete.",
+  };
+}
+
 function deltaAvailabilityTone(signal: DeltaSignal | null) {
   if (signal?.deltaAvailability === "DIRECTIONAL") {
     return {
@@ -1406,18 +2012,20 @@ function deltaStrengthTone(signal: DeltaSignal | null) {
 function deltaStrengthLabel(signal: DeltaSignal | null) {
   if (!signal) return "Pending";
   if (signal.deltaAvailability === "UNSUPPORTED") return "Not tracked";
-  if (signal.deltaAvailability === "UNAVAILABLE") return "No read";
-  if (signal.deltaAvailability === "SOURCE_ONLY") return "Source active";
+  if (signal.deltaAvailability === "UNAVAILABLE") return "No source";
+  if (signal.deltaAvailability === "SOURCE_ONLY") {
+    return signal.strength && signal.strength > 0 ? `${Math.round(signal.strength * 100)}% flow` : "Flow present";
+  }
   return `${Math.round((signal.strength ?? 0) * 100)}%`;
 }
 
 function deltaSummary(signal: DeltaSignal | null) {
-  if (!signal) return "Waiting for delta source.";
+  if (!signal) return "Waiting for live delta evidence.";
   if (signal.deltaAvailability === "DIRECTIONAL") {
-    return "Real directional delta is available for this asset.";
+    return "Real directional delta exposure is visible for this asset.";
   }
   if (signal.deltaAvailability === "SOURCE_ONLY") {
-    return "Real source flow is active, but no directional delta read is justified.";
+    return "Real source flow is visible, but the current imbalance is still weak or non-directional.";
   }
   if (signal.deltaAvailability === "UNSUPPORTED") {
     return "Delta is not supported for this asset yet.";
@@ -1425,30 +2033,51 @@ function deltaSummary(signal: DeltaSignal | null) {
   return "No usable delta source is available right now.";
 }
 
-function positioningAvailabilityPill(positioning: ActusPositioning | null) {
-  if (positioning?.positioningType === "REAL_GAMMA") {
+function positioningAvailabilityPill(positioning: ActusPositioning | null, gammaOverlay: GammaOverlay | null) {
+  return gammaExposureState(positioning, gammaOverlay);
+}
+
+function positioningClassificationState(positioning: ActusPositioning | null, gammaOverlay: GammaOverlay | null) {
+  const sourceAvailable = Boolean(gammaOverlay?.source) || Boolean(positioning?.gammaSourceAvailable);
+  const upper = positioning?.levels?.upper ?? gammaOverlay?.callWall ?? null;
+  const lower = positioning?.levels?.lower ?? gammaOverlay?.putWall ?? null;
+  const anchor = positioning?.levels?.anchor ?? gammaOverlay?.anchor ?? gammaOverlay?.gammaFlip ?? null;
+  const gammaFlip = gammaOverlay?.gammaFlip ?? null;
+  const levelsAvailable =
+    Boolean(positioning?.gammaLevelsAvailable) ||
+    hasFiniteGammaExposureValue(upper) ||
+    hasFiniteGammaExposureValue(lower) ||
+    hasFiniteGammaExposureValue(anchor) ||
+    hasFiniteGammaExposureValue(gammaFlip);
+
+  if (sourceAvailable && levelsAvailable) {
     return {
-      label: "Positioning: Active",
-      color: "#d7ffea",
-      background: "rgba(69,255,181,0.12)",
-      border: "rgba(69,255,181,0.3)",
+      label: "REAL_GAMMA",
+      tone: positioningTypeTone("REAL_GAMMA"),
+      summary: "Real gamma source-backed positioning is resolved, even if the edge is still weak.",
     };
   }
 
-   if (positioning?.positioningType === "POSITIONING_PROXY") {
+  if (sourceAvailable) {
     return {
-      label: "Positioning: Proxy",
-      color: "#c8dcff",
-      background: "rgba(103,183,255,0.09)",
-      border: "rgba(103,183,255,0.22)",
+      label: "GAMMA_SOURCE_ONLY",
+      tone: "#9fc4ff",
+      summary: "A real gamma source is active, but positioning remains incomplete because honest levels are not resolved yet.",
+    };
+  }
+
+  if (positioning?.positioningType === "POSITIONING_PROXY") {
+    return {
+      label: "POSITIONING_PROXY",
+      tone: positioningTypeTone("POSITIONING_PROXY"),
+      summary: "ACTUS is relying on indirect positioning context because no real gamma structure is resolved.",
     };
   }
 
   return {
-    label: "Positioning: Unavailable",
-    color: "#b8c7df",
-    background: "rgba(255,255,255,0.035)",
-    border: "rgba(142,160,191,0.16)",
+    label: "UNAVAILABLE",
+    tone: "#9fb0cb",
+    summary: "No honest positioning source is available right now.",
   };
 }
 
@@ -1457,23 +2086,30 @@ function buildActusChartGammaOverlay(
   positioning: ActusPositioning | null,
   gammaOverlay: GammaOverlay | null,
 ): GammaOverlay | null {
-  if (!positioning || positioning.positioningType !== "REAL_GAMMA" || !positioning.gammaLevelsAvailable) {
+  if (!gammaOverlay?.source) {
     return null;
   }
 
-  const upper = positioning.levels?.upper ?? gammaOverlay?.callWall ?? null;
-  const lower = positioning.levels?.lower ?? gammaOverlay?.putWall ?? null;
-  const anchor = positioning.levels?.anchor ?? gammaOverlay?.anchor ?? gammaOverlay?.gammaFlip ?? null;
+  const upper = gammaOverlay?.callWall ?? positioning?.levels?.upper ?? null;
+  const lower = gammaOverlay?.putWall ?? positioning?.levels?.lower ?? null;
+  const anchor = gammaOverlay?.anchor ?? positioning?.levels?.anchor ?? gammaOverlay?.gammaFlip ?? null;
+  const gammaFlip = gammaOverlay?.gammaFlip ?? null;
+  const levelsAvailable =
+    hasFiniteGammaExposureValue(upper) ||
+    hasFiniteGammaExposureValue(lower) ||
+    hasFiniteGammaExposureValue(anchor) ||
+    hasFiniteGammaExposureValue(gammaFlip);
   const spotReference =
-    gammaOverlay?.spotReference ??
-    (typeof item.price === "number" && Number.isFinite(item.price) ? item.price : null);
+    typeof item.price === "number" && Number.isFinite(item.price)
+      ? item.price
+      : gammaOverlay?.spotReference ?? null;
 
   return {
     ...gammaOverlay,
-    callWall: upper,
-    putWall: lower,
-    anchor,
-    gammaFlip: positioning.gammaDirectionalAvailable ? gammaOverlay?.gammaFlip ?? null : null,
+    callWall: levelsAvailable ? upper : null,
+    putWall: levelsAvailable ? lower : null,
+    anchor: levelsAvailable ? anchor : null,
+    gammaFlip: levelsAvailable ? gammaFlip : null,
     spotReference,
   };
 }
@@ -1605,6 +2241,22 @@ function actusStopDistance(item: ActusOpportunityOutput) {
   return Math.abs(item.price - item.invalidation);
 }
 
+function actusExecutionPrecision(symbol: string) {
+  const normalized = symbol.toUpperCase();
+  if (normalized === "EUR/USD" || normalized === "EURUSD" || normalized === "6E") {
+    return 5;
+  }
+  return 2;
+}
+
+function formatActusExecutionValue(symbol: string, value: number) {
+  const precision = actusExecutionPrecision(symbol);
+  return value.toLocaleString(undefined, {
+    minimumFractionDigits: precision,
+    maximumFractionDigits: precision,
+  });
+}
+
 function actusMomentumState(item: ActusOpportunityOutput) {
   const points = item.sparkline;
   if (points.length < 4) return "Stable";
@@ -1613,6 +2265,54 @@ function actusMomentumState(item: ActusOpportunityOutput) {
   if (directionalRecent > Math.max(item.price * 0.001, 0.12)) return "Building";
   if (directionalRecent < -Math.max(item.price * 0.001, 0.12)) return "Weakening";
   return "Stable";
+}
+
+function buildSolCmeLiquidityIndicator(
+  chartSymbol: string,
+  chartCandles: NormalizedFuturesCandle[] | null,
+  timeframe: TimeframeFilter,
+) {
+  if (chartSymbol !== "SOL_CME" || !chartCandles || chartCandles.length < 8) {
+    return null;
+  }
+
+  const recentWindowSize = timeframe === "1m" ? 120 : timeframe === "5m" ? 96 : 64;
+  const recent = chartCandles.slice(-recentWindowSize);
+  if (recent.length < 8) {
+    return null;
+  }
+
+  const timeframeMs = actusTimeframeDurationMs(timeframe);
+  const firstMs = Date.parse(recent[0].timestamp);
+  const lastMs = Date.parse(recent[recent.length - 1].timestamp);
+  if (!Number.isFinite(firstMs) || !Number.isFinite(lastMs) || lastMs < firstMs) {
+    return null;
+  }
+
+  const spanBuckets = Math.max(1, Math.round((lastMs - firstMs) / timeframeMs) + 1);
+  const density = recent.length / spanBuckets;
+  let maxGapBuckets = 0;
+
+  for (let index = 1; index < recent.length; index += 1) {
+    const previousMs = Date.parse(recent[index - 1].timestamp);
+    const currentMs = Date.parse(recent[index].timestamp);
+    if (!Number.isFinite(previousMs) || !Number.isFinite(currentMs)) {
+      continue;
+    }
+    const gapBuckets = Math.max(0, Math.round((currentMs - previousMs) / timeframeMs) - 1);
+    if (gapBuckets > maxGapBuckets) {
+      maxGapBuckets = gapBuckets;
+    }
+  }
+
+  if (density >= 0.78 && maxGapBuckets < 3) {
+    return null;
+  }
+
+  return {
+    label: "THIN PRINT ENVIRONMENT",
+    detail: "CME SOL structure is valid, but recent prints are sparse by market nature.",
+  };
 }
 
 function displaySetupType(setupType: ActusOpportunityOutput["setupType"]) {
@@ -2274,6 +2974,7 @@ function heroSignalCard(hero: ActusOpportunityOutput, nowTick: number, onOpenAct
   const riskColor = riskToneValue(hero.riskState);
   const heroAgeColor = actusFreshnessTone(hero);
   const chartId = `hero-${hero.symbol}-${hero.timeframe}-${hero.action}-${hero.sparkline.length}-${hero.sparkline[0] ?? 0}-${hero.sparkline[hero.sparkline.length - 1] ?? 0}`;
+  const sourceQualifier = actusSourceQualifier(hero.symbol);
 
   return (
     <section
@@ -2293,6 +2994,11 @@ function heroSignalCard(hero: ActusOpportunityOutput, nowTick: number, onOpenAct
           <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <span style={{ fontSize: 24, fontWeight: 700, color: "#f4f7fb", letterSpacing: "-0.03em" }}>{hero.action.toUpperCase()}:</span>
             <span style={{ fontSize: 28, fontWeight: 800, color: colors.text, letterSpacing: "-0.035em" }}>{hero.symbol}</span>
+            {sourceQualifier ? (
+              <span style={{ fontSize: 11, color: "#9fb0cb", letterSpacing: "0.16em", textTransform: "uppercase", fontWeight: 700 }}>
+                {sourceQualifier}
+              </span>
+            ) : null}
             {badge(displayState(hero.state), liveStateTone.text, liveStateTone.bg, liveStateTone.border)}
             {badge(displayDirection(hero.direction), directionalTone.text, directionalTone.bg, directionalTone.border)}
             {onOpenActusMode ? ghostButton("ACTUS Mode", () => onOpenActusMode(hero.symbol), colors.text) : null}
@@ -2369,10 +3075,11 @@ function heroSignalCard(hero: ActusOpportunityOutput, nowTick: number, onOpenAct
 }
 
 function actusModePanel(
-  item: ActusOpportunityOutput,
+  item: ActusModeRenderableAsset,
   chartCandles: NormalizedFuturesCandle[] | null,
   gammaOverlay: GammaOverlay | null,
   deltaSignal: DeltaSignal | null,
+  nyOpenFlow: NyOpenFlowSnapshot | null,
   replayState: ActusReplayState,
   nowTick: number,
   onExit: () => void,
@@ -2387,6 +3094,10 @@ function actusModePanel(
   onFillPriceDraftChange: (item: ActusOpportunityOutput, value: string) => void,
   onOrderFilled: (item: ActusOpportunityOutput) => void,
   onClosePosition: (item: ActusOpportunityOutput) => void,
+  assetUniverse: readonly string[],
+  onSwitchAsset: (symbol: string) => void,
+  solView: SolActusView,
+  onSolViewChange: (view: SolActusView) => void,
 ) {
   const colors = tone(item.action);
   const directionalTone = directionTone(item.direction);
@@ -2470,7 +3181,9 @@ function actusModePanel(
     : [];
   const unifiedPositioning = deriveActusPositioning(item, gammaOverlay, deltaSignal);
   const chartGammaOverlay = buildActusChartGammaOverlay(item, unifiedPositioning, gammaOverlay);
-  const positioningPill = positioningAvailabilityPill(unifiedPositioning);
+  const positioningPill = positioningAvailabilityPill(unifiedPositioning, gammaOverlay);
+  const positioningClassification = positioningClassificationState(unifiedPositioning, gammaOverlay);
+  const actionabilityPill = actionabilityState(unifiedPositioning);
   const decisionDrivers = unifiedPositioning?.drivers.slice(0, 2) ?? [];
   const deltaTone = deltaAvailabilityTone(deltaSignal);
   const displayedConfidenceScore =
@@ -2492,7 +3205,12 @@ function actusModePanel(
   const canMarkFilled = !position && !closedPosition && baseExecutionBlock.primary !== "DO NOT TRADE";
   const entryDisplay = position?.filledPrice ?? item.entry;
   const stopDisplay = position?.stop ?? item.invalidation;
+  const executionRisk = Math.abs(entryDisplay - stopDisplay);
+  const executionRiskDisplay = formatActusExecutionValue(item.symbol, executionRisk);
   const replayCandleCount = chartCandles?.length ?? 0;
+  const sourceQualifier = item.actusSourceLabel ?? actusSourceQualifier(item.symbol, solView);
+  const chartSymbol = item.actusChartSymbol ?? item.symbol;
+  const solCmeLiquidityIndicator = buildSolCmeLiquidityIndicator(chartSymbol, chartCandles, item.timeframe);
   return (
     <section
       style={{
@@ -2520,6 +3238,11 @@ function actusModePanel(
         <div style={{ display: "grid", gap: 6, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
             <div style={{ fontSize: 30, fontWeight: 780, color: "#f4f7fb", letterSpacing: "-0.045em", lineHeight: 1 }}>{item.symbol}</div>
+            {sourceQualifier ? (
+              <div style={{ fontSize: 11, color: "#9fb0cb", letterSpacing: "0.16em", textTransform: "uppercase", fontWeight: 700 }}>
+                {sourceQualifier}
+              </div>
+            ) : null}
             <div style={{ fontSize: 14, fontWeight: 760, color: directionalTone.text, letterSpacing: "0.13em", textTransform: "uppercase" }}>
               {displayDirection(item.direction)}
             </div>
@@ -2529,6 +3252,39 @@ function actusModePanel(
             <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>{item.timeframe}</div>
             <div style={{ width: 4, height: 4, borderRadius: 999, background: "rgba(142,160,191,0.42)" }} />
             <div style={{ fontSize: 12, color: "#9fb0cb", lineHeight: 1.35 }}>{item.summary}</div>
+            {solCmeLiquidityIndicator ? (
+              <>
+                <div style={{ width: 4, height: 4, borderRadius: 999, background: "rgba(142,160,191,0.42)" }} />
+                <div
+                  title={solCmeLiquidityIndicator.detail}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 7,
+                    padding: "5px 9px",
+                    borderRadius: 999,
+                    color: "#d8e7ff",
+                    background: "rgba(103,183,255,0.08)",
+                    border: "1px solid rgba(103,183,255,0.18)",
+                    fontSize: 10,
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    fontWeight: 800,
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: 999,
+                      background: "#67b7ff",
+                      boxShadow: "0 0 8px rgba(103,183,255,0.55)",
+                    }}
+                  />
+                  <span>{solCmeLiquidityIndicator.label}</span>
+                </div>
+              </>
+            ) : null}
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
@@ -2611,7 +3367,51 @@ function actusModePanel(
         </div>
       </div>
 
-      <div style={{ display: "grid", gap: 16 }}>
+      {isSolActusSymbol(item.symbol) ? (
+        <div
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            padding: 4,
+            borderRadius: 999,
+            background: "rgba(255,255,255,0.025)",
+            border: "1px solid rgba(142,160,191,0.12)",
+            width: "fit-content",
+          }}
+        >
+          {([
+            { id: "binance-execution", label: "Binance Execution" },
+            { id: "cme-structure", label: "CME Structure" },
+          ] as const).map((option) => {
+            const active = solView === option.id;
+            return (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => onSolViewChange(option.id)}
+                style={{
+                  border: active ? "1px solid rgba(69,255,181,0.28)" : "1px solid rgba(142,160,191,0.12)",
+                  background: active ? "rgba(69,255,181,0.1)" : "rgba(255,255,255,0.02)",
+                  color: active ? "#e7fff5" : "#aebdd8",
+                  borderRadius: 999,
+                  padding: "8px 12px",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  fontWeight: 800,
+                }}
+              >
+                {option.label}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.42fr) minmax(220px, 0.42fr)", gap: 16, alignItems: "start" }}>
+        <div style={{ display: "grid", gap: 16 }}>
         <div
           style={{
             padding: "4px 4px 3px",
@@ -2743,12 +3543,15 @@ function actusModePanel(
           ) : null}
           <div style={{ borderRadius: 12, overflow: "hidden", background: "linear-gradient(180deg, rgba(12,18,30,0.42), rgba(8,12,22,0.84))", minHeight: 286 }}>
             <ActusChart
-              symbol={item.symbol}
+              symbol={chartSymbol}
               candles={chartCandles}
+              livePrice={item.price}
               timeframe={item.timeframe}
               height={286}
               entry={entryDisplay}
               invalidation={stopDisplay}
+              dayHigh={item.sessionContext?.dayHigh ?? null}
+              dayLow={item.sessionContext?.dayLow ?? null}
               gammaOverlay={chartGammaOverlay}
               deltaSignal={deltaSignal}
             />
@@ -2835,7 +3638,7 @@ function actusModePanel(
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
                     <div style={{ display: "grid", gap: 5 }}>
-                      <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>ACTUS Decision</div>
+                      <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>ACTUS Judgment</div>
                       <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
                         <div style={{ fontSize: 19, fontWeight: 820, color: "#f4f7fb", letterSpacing: "-0.03em", lineHeight: 1.05 }}>
                           {unifiedPositioning.bias === "NEUTRAL"
@@ -2847,11 +3650,7 @@ function actusModePanel(
                         </div>
                       </div>
                       <div style={{ fontSize: 12, color: "#aebdd8", lineHeight: 1.4 }}>
-                        {unifiedPositioning.positioningType === "REAL_GAMMA"
-                          ? "Real positioning levels are in force."
-                          : unifiedPositioning.positioningType === "POSITIONING_PROXY"
-                            ? "Proxy positioning is guiding the decision surface."
-                            : "No options positioning data is available."}
+                        {actionabilityPill.summary}
                       </div>
                     </div>
                     <div style={{ display: "grid", gap: 8, justifyItems: "end" }}>
@@ -2862,17 +3661,17 @@ function actusModePanel(
                           gap: 8,
                           padding: "8px 11px",
                           borderRadius: 999,
-                          color: positioningPill.color,
-                          background: positioningPill.background,
-                          border: `1px solid ${positioningPill.border}`,
+                          color: actionabilityPill.color,
+                          background: actionabilityPill.background,
+                          border: `1px solid ${actionabilityPill.border}`,
                           fontSize: 11,
                           letterSpacing: "0.08em",
                           textTransform: "uppercase",
                           fontWeight: 800,
-                          boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 20px ${positioningPill.background}`,
+                          boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 20px ${actionabilityPill.background}`,
                         }}
                       >
-                        {positioningPill.label}
+                        {actionabilityPill.label}
                       </div>
                       <div
                         style={{
@@ -2894,16 +3693,172 @@ function actusModePanel(
                     </div>
                   </div>
 
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
-                    {decisionPanelField("Positioning", positioningPill.label.replace("Positioning: ", ""), positioningTypeTone(unifiedPositioning.positioningType))}
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Exposure Map</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                      <div
+                        style={{
+                          display: "grid",
+                          gap: 10,
+                          padding: "12px 12px 10px",
+                          borderRadius: 14,
+                          background:
+                            "radial-gradient(circle at top right, rgba(103,183,255,0.05), transparent 28%), linear-gradient(180deg, rgba(8,12,20,0.72), rgba(5,8,15,0.9))",
+                          border: "1px solid rgba(118,138,176,0.12)",
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+                          <div style={{ display: "grid", gap: 4 }}>
+                            <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Gamma Exposure</div>
+                            <div style={{ fontSize: 12, color: "#aebdd8", lineHeight: 1.35 }}>
+                              {positioningPill.summary}
+                            </div>
+                          </div>
+                          <div
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 8,
+                              padding: "7px 10px",
+                              borderRadius: 999,
+                              color: positioningPill.color,
+                              background: positioningPill.background,
+                              border: `1px solid ${positioningPill.border}`,
+                              fontSize: 10,
+                              letterSpacing: "0.08em",
+                              textTransform: "uppercase",
+                              fontWeight: 800,
+                              boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 16px ${positioningPill.background}`,
+                            }}
+                          >
+                            <span
+                              style={{
+                                width: 6,
+                                height: 6,
+                                borderRadius: 999,
+                                background: positioningPill.color,
+                                boxShadow: `0 0 10px ${positioningPill.color}`,
+                              }}
+                            />
+                            <span>{positioningPill.label}</span>
+                          </div>
+                        </div>
+
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                          {deltaPanelField("Source", gammaExposureSourceLabel(gammaOverlay), "#d8e7ff", gammaOverlay?.updatedAt ? "Live source resolved" : "No source stamp")}
+                          {deltaPanelField("Structure", gammaExposureDetail(unifiedPositioning, gammaOverlay), positioningPill.color, "Exposure map only")}
+                          {deltaPanelField(
+                            "Levels",
+                            unifiedPositioning.gammaDirectionalAvailable
+                              ? "Flip + walls"
+                              : unifiedPositioning.gammaLevelsAvailable || Boolean(gammaOverlay?.source)
+                                ? "Partial / mapped"
+                                : "Absent",
+                            positioningPill.color,
+                            unifiedPositioning.gammaDirectionalAvailable ? "Directional map" : "Not a conviction signal by itself",
+                          )}
+                        </div>
+                      </div>
+
+                      {deltaSignal ? (
+                        <div
+                          style={{
+                            display: "grid",
+                            gap: 10,
+                            padding: "12px 12px 10px",
+                            borderRadius: 14,
+                            background:
+                              "radial-gradient(circle at top right, rgba(103,183,255,0.05), transparent 28%), linear-gradient(180deg, rgba(8,12,20,0.72), rgba(5,8,15,0.9))",
+                            border: "1px solid rgba(118,138,176,0.12)",
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+                            <div style={{ display: "grid", gap: 4 }}>
+                              <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Delta Exposure</div>
+                              <div style={{ fontSize: 12, color: "#aebdd8", lineHeight: 1.35 }}>
+                                {deltaSummary(deltaSignal)}
+                              </div>
+                            </div>
+                            <div
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: 8,
+                                padding: "7px 10px",
+                                borderRadius: 999,
+                                color: deltaTone.color,
+                                background: deltaTone.background,
+                                border: `1px solid ${deltaTone.border}`,
+                                fontSize: 10,
+                                letterSpacing: "0.08em",
+                                textTransform: "uppercase",
+                                fontWeight: 800,
+                                boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 16px ${deltaTone.background}`,
+                              }}
+                            >
+                              <span
+                                style={{
+                                  width: 6,
+                                  height: 6,
+                                  borderRadius: 999,
+                                  background: deltaTone.color,
+                                  boxShadow: `0 0 10px ${deltaTone.color}`,
+                                }}
+                              />
+                              <span>{deltaTone.label}</span>
+                            </div>
+                          </div>
+
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                            {deltaPanelField(
+                              "Evidence",
+                              deltaSignal.deltaAvailability === "DIRECTIONAL"
+                                ? "Directional"
+                                : deltaSignal.deltaAvailability === "SOURCE_ONLY"
+                                  ? "Flow present"
+                                  : deltaSignal.deltaAvailability === "UNSUPPORTED"
+                                    ? "Unsupported"
+                                    : "Unavailable",
+                              deltaTone.color,
+                              deltaSignal.deltaDirectionalAvailable ? "Source + imbalance" : "Source truth without conviction",
+                            )}
+                            {deltaPanelField(
+                              "Bias",
+                              deltaSignal.deltaDirectionalAvailable ? (deltaSignal.bias ?? "NEUTRAL") : "NEUTRAL",
+                              gammaBiasTone(deltaSignal.deltaDirectionalAvailable ? deltaSignal.bias ?? "NEUTRAL" : "NEUTRAL"),
+                              deltaSignal.deltaDirectionalAvailable ? "Directional flow" : "No directional edge",
+                            )}
+                            {deltaPanelField(
+                              "Read Quality",
+                              deltaStrengthLabel(deltaSignal),
+                              deltaStrengthTone(deltaSignal),
+                              deltaSignal.deltaAvailability === "DIRECTIONAL"
+                                ? "Net known flow imbalance"
+                                : deltaSignal.deltaAvailability === "SOURCE_ONLY"
+                                  ? "Real source flow"
+                                  : deltaSignal.deltaAvailability === "UNSUPPORTED"
+                                    ? "Not in current stack"
+                                    : "No usable source",
+                            )}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Judgment Layer</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
+                    {decisionPanelField("Positioning", positioningClassification.label.replace(/_/g, " "), positioningClassification.tone)}
                     {decisionPanelField("Regime", unifiedPositioning.regime)}
                     {decisionPanelField("Bias", unifiedPositioning.bias, gammaBiasTone(unifiedPositioning.bias))}
                     {decisionPanelField("Condition", unifiedPositioning.condition.replace("_", " "), gammaConditionTone(unifiedPositioning.condition))}
+                    </div>
                   </div>
 
                   {decisionDrivers.length ? (
                     <div style={{ display: "grid", gap: 6 }}>
-                      <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Drivers</div>
+                      <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Judgment Drivers</div>
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                         {decisionDrivers.map((driver, index) => (
                           <span
@@ -2932,88 +3887,6 @@ function actusModePanel(
                     </div>
                   ) : null}
 
-                  {deltaSignal ? (
-                    <div
-                      style={{
-                        display: "grid",
-                        gap: 10,
-                        padding: "12px 12px 10px",
-                        borderRadius: 14,
-                        background:
-                          "radial-gradient(circle at top right, rgba(103,183,255,0.05), transparent 28%), linear-gradient(180deg, rgba(8,12,20,0.72), rgba(5,8,15,0.9))",
-                        border: "1px solid rgba(118,138,176,0.12)",
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
-                        <div style={{ display: "grid", gap: 4 }}>
-                          <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Delta Read</div>
-                          <div style={{ fontSize: 12, color: "#aebdd8", lineHeight: 1.35 }}>
-                            {deltaSummary(deltaSignal)}
-                          </div>
-                        </div>
-                        <div
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: 8,
-                            padding: "7px 10px",
-                            borderRadius: 999,
-                            color: deltaTone.color,
-                            background: deltaTone.background,
-                            border: `1px solid ${deltaTone.border}`,
-                            fontSize: 10,
-                            letterSpacing: "0.08em",
-                            textTransform: "uppercase",
-                            fontWeight: 800,
-                            boxShadow: `inset 0 1px 0 rgba(255,255,255,0.03), 0 0 16px ${deltaTone.background}`,
-                          }}
-                        >
-                          <span
-                            style={{
-                              width: 6,
-                              height: 6,
-                              borderRadius: 999,
-                              background: deltaTone.color,
-                              boxShadow: `0 0 10px ${deltaTone.color}`,
-                            }}
-                          />
-                          <span>{deltaTone.label}</span>
-                        </div>
-                      </div>
-
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
-                        {deltaPanelField(
-                          "Bias",
-                          deltaSignal.deltaDirectionalAvailable ? (deltaSignal.bias ?? "NEUTRAL") : "NEUTRAL",
-                          gammaBiasTone(deltaSignal.deltaDirectionalAvailable ? deltaSignal.bias ?? "NEUTRAL" : "NEUTRAL"),
-                          deltaSignal.deltaDirectionalAvailable ? "Directional flow" : "No directional edge",
-                        )}
-                        {deltaPanelField(
-                          "Condition",
-                          (deltaSignal.condition ?? "NEUTRAL").replace("_", " "),
-                          deltaSignal.deltaAvailability === "DIRECTIONAL"
-                            ? deltaSignal.condition === "ACCUMULATION"
-                              ? "#3ef0a6"
-                              : deltaSignal.condition === "DISTRIBUTION"
-                                ? "#ff8ea8"
-                                : "#67b7ff"
-                            : "#c8d5ee",
-                        )}
-                        {deltaPanelField(
-                          "Read Quality",
-                          deltaStrengthLabel(deltaSignal),
-                          deltaStrengthTone(deltaSignal),
-                          deltaSignal.deltaAvailability === "DIRECTIONAL"
-                            ? "Net known flow imbalance"
-                            : deltaSignal.deltaAvailability === "SOURCE_ONLY"
-                              ? "Source active"
-                              : deltaSignal.deltaAvailability === "UNSUPPORTED"
-                                ? "Not in current stack"
-                                : "No usable source",
-                        )}
-                      </div>
-                    </div>
-                  ) : null}
                 </div>
               ) : null}
               {canMarkFilled ? (
@@ -3083,6 +3956,11 @@ function actusModePanel(
                 <div style={{ fontSize: 10, color: "#ff6f91", letterSpacing: "0.1em", textTransform: "uppercase", fontWeight: 700 }}>Stop</div>
                 <div style={{ marginTop: 5, fontSize: 18, color: "#f4f7fb", fontWeight: 700 }}>{stopDisplay.toLocaleString()}</div>
               </div>
+              <div style={{ padding: "10px 11px", borderRadius: 12, background: "linear-gradient(180deg, rgba(17,15,8,0.52), rgba(11,9,4,0.78))", border: "1px solid rgba(201,166,94,0.16)" }}>
+                <div style={{ fontSize: 10, color: "#d6b86e", letterSpacing: "0.1em", textTransform: "uppercase", fontWeight: 700 }}>Risk</div>
+                <div style={{ marginTop: 5, fontSize: 18, color: "#f4f7fb", fontWeight: 700 }}>{executionRiskDisplay}</div>
+                <div style={{ marginTop: 4, fontSize: 10, color: "#8ea0bf", letterSpacing: "0.06em", textTransform: "uppercase" }}>Entry to Stop</div>
+              </div>
             </div>
           </div>
         </div>
@@ -3105,6 +3983,17 @@ function actusModePanel(
           {compactMetricCard("Risk", displayRisk(item.riskState), undefined, riskColor)}
         </div>
 
+        {compactNyOpenFlowLabel(nyOpenFlow) ? (
+          <div style={{ padding: "11px 13px", borderRadius: 14, background: "rgba(255,255,255,0.014)", border: "1px solid rgba(142,160,191,0.06)", display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <div style={{ fontSize: 13, color: "#e6edf9", lineHeight: 1.4, fontWeight: 600 }}>
+              {compactNyOpenFlowLabel(nyOpenFlow)}
+            </div>
+            <div style={{ fontSize: 11, color: nyOpenFlowAccent(nyOpenFlow), letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 700 }}>
+              13:30-14:00 UTC
+            </div>
+          </div>
+        ) : null}
+
         {(riskWatchLines.length || positioningLines.length) ? (
           <div style={{ padding: "11px 13px", borderRadius: 14, background: "rgba(255,255,255,0.014)", border: "1px solid rgba(142,160,191,0.06)", display: "grid", gap: 5 }}>
             <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Watch / Risk</div>
@@ -3120,6 +4009,68 @@ function actusModePanel(
             ))}
           </div>
         ) : null}
+        </div>
+        <aside
+          style={{
+            display: "grid",
+            gap: 10,
+            alignSelf: "start",
+            padding: "12px 14px",
+            borderRadius: 16,
+            background: "linear-gradient(180deg, rgba(10,14,25,0.62), rgba(5,8,14,0.84))",
+            border: "1px solid rgba(118,138,176,0.08)",
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.02)",
+          }}
+        >
+          <div style={{ display: "grid", gap: 4 }}>
+            <div style={{ fontSize: 10, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>ACTUS Mode</div>
+            <div style={{ fontSize: 15, color: "#f4f7fb", fontWeight: 700 }}>Asset Switcher</div>
+          </div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {assetUniverse.map((symbol) => {
+              const isActive = actusModeSelectionSymbolCandidates(symbol).includes(item.symbol.toUpperCase());
+              return (
+                <div
+                  key={`actus-mode-switch-${symbol}`}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "minmax(0, 1fr) auto",
+                    gap: 10,
+                    alignItems: "center",
+                    padding: "9px 10px",
+                    borderRadius: 12,
+                    background: isActive ? "rgba(69,255,181,0.08)" : "rgba(255,255,255,0.018)",
+                    border: isActive ? "1px solid rgba(69,255,181,0.22)" : "1px solid rgba(118,138,176,0.1)",
+                  }}
+                >
+                  <div style={{ fontSize: 13, color: isActive ? "#f4f7fb" : "#d7e1f4", fontWeight: isActive ? 700 : 600 }}>
+                    {symbol}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onSwitchAsset(symbol)}
+                    disabled={isActive}
+                    style={{
+                      border: isActive ? "1px solid rgba(69,255,181,0.24)" : "1px solid rgba(142,160,191,0.16)",
+                      background: isActive ? "rgba(69,255,181,0.1)" : "rgba(255,255,255,0.02)",
+                      color: isActive ? "#45ffb5" : "#d7e1f4",
+                      borderRadius: 999,
+                      padding: "7px 10px",
+                      cursor: isActive ? "default" : "pointer",
+                      fontSize: 10,
+                      fontWeight: 800,
+                      letterSpacing: "0.08em",
+                      textTransform: "uppercase",
+                      opacity: isActive ? 0.95 : 1,
+                    }}
+                  >
+                    {isActive ? "Active" : "ACTUS MODE"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </aside>
       </div>
     </section>
   );
@@ -3191,8 +4142,8 @@ function laneCard(
 }
 
 export default function App() {
-  const [productPrefs, setProductPrefs] = useState<ProductPrefs>(() => readLocalStorage(PRODUCT_PREFS_KEY, DEFAULT_PRODUCT_PREFS));
-  const [selectedTimeframe, setSelectedTimeframe] = useState<TimeframeFilter>(() => readLocalStorage(PRODUCT_PREFS_KEY, DEFAULT_PRODUCT_PREFS).preferredTimeframe);
+  const [productPrefs, setProductPrefs] = useState<ProductPrefs>(() => readProductPrefs());
+  const [selectedTimeframe, setSelectedTimeframe] = useState<TimeframeFilter>(() => readProductPrefs().preferredTimeframe);
   const { snapshot, loading, hasCachedInputs, refresh } = useActusPlatform(selectedTimeframe);
   const [viewMode, setViewMode] = useState<ViewMode>("focus");
   const [actusModeSelection, setActusModeSelection] = useState<ActusModeSelection | null>(null);
@@ -3218,21 +4169,32 @@ export default function App() {
   });
   const [actusModeGammaBase, setActusModeGammaBase] = useState<GammaOverlay | null>(null);
   const [actusModeDeltaSignal, setActusModeDeltaSignal] = useState<DeltaSignal | null>(null);
+  const [actusModeRefreshTick, setActusModeRefreshTick] = useState(0);
   const [nowTick, setNowTick] = useState(0);
   const [commandHistory, setCommandHistory] = useState<CommandHistoryEntry[]>([]);
   const [inAppAlert, setInAppAlert] = useState<InAppAlert | null>(null);
   const [internalAlertEvents, setInternalAlertEvents] = useState<ActusInternalAlertEvent[]>([]);
+  const [browserNotificationPermission, setBrowserNotificationPermission] = useState<NotificationPermission | "unsupported">(
+    () => currentBrowserNotificationPermission(),
+  );
   const [setupHistory, setSetupHistory] = useState<SetupHistoryEntry[]>(() => readLocalStorage(PRODUCT_HISTORY_KEY, [] as SetupHistoryEntry[]));
   const [openPositions, setOpenPositions] = useState<Record<string, OpenPositionRecord>>(() => readLocalStorage(OPEN_POSITIONS_KEY, {} as Record<string, OpenPositionRecord>));
   const [closedPositions, setClosedPositions] = useState<Record<string, ClosedPositionRecord>>(() => readLocalStorage(CLOSED_POSITIONS_KEY, {} as Record<string, ClosedPositionRecord>));
   const [fillPriceDrafts, setFillPriceDrafts] = useState<Record<string, string>>({});
+  const [nyOpenFlowByAsset, setNyOpenFlowByAsset] = useState<NyOpenFlowMap>({});
+  const [nyOpenFlowHistoryByAsset, setNyOpenFlowHistoryByAsset] = useState<NyOpenFlowHistoryMap>({});
   const [workflowAsset, setWorkflowAsset] = useState<string>("all");
   const alertTimestampsRef = useRef<Record<string, number>>({});
   const previousLifecycleRef = useRef<Record<string, ActusExecutionState>>({});
+  const previousLaneActionRef = useRef<Record<string, ActusAction>>({});
   const previousManagementSignalRef = useRef<Record<string, string>>({});
   const previousInternalAlertStateRef = useRef<Record<string, ActusInternalAlertSnapshot>>({});
   const emittedInternalAlertSignaturesRef = useRef<Record<string, number>>({});
+  const deliveredBrowserAlertIdsRef = useRef<Record<string, number>>({});
+  const playedExecuteAlertSignaturesRef = useRef<Record<string, number>>({});
   const openSetupsRef = useRef<Record<string, OpenSetupRecord>>({});
+  const actusModeGammaKeyRef = useRef<string | null>(null);
+  const actusModeDeltaKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -3245,6 +4207,81 @@ export default function App() {
   useEffect(() => {
     writeLocalStorage(PRODUCT_PREFS_KEY, productPrefs);
   }, [productPrefs]);
+
+  useEffect(() => {
+    if (!browserNotificationsSupported()) {
+      return;
+    }
+
+    const syncPermission = () => {
+      setBrowserNotificationPermission(currentBrowserNotificationPermission());
+    };
+
+    syncPermission();
+    window.addEventListener("focus", syncPermission);
+    document.addEventListener("visibilitychange", syncPermission);
+
+    return () => {
+      window.removeEventListener("focus", syncPermission);
+      document.removeEventListener("visibilitychange", syncPermission);
+    };
+  }, []);
+
+  const nyOpenFlowAssets = useMemo(() => {
+    const symbols = new Set<string>();
+    snapshot.opportunities.forEach((item) => {
+      const asset = mapSymbolToNyOpenFlowAsset(item.symbol);
+      if (asset) {
+        symbols.add(asset);
+      }
+    });
+    const actusAsset = actusModeSelection ? mapSymbolToNyOpenFlowAsset(actusModeSelection.symbol) : null;
+    if (actusAsset) {
+      symbols.add(actusAsset);
+    }
+    return [...symbols] as NyOpenFlowAsset[];
+  }, [snapshot.opportunities, actusModeSelection]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!nyOpenFlowAssets.length) {
+      setNyOpenFlowByAsset({});
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const load = async () => {
+      const results = await Promise.all(
+        nyOpenFlowAssets.map(async (asset) => {
+          try {
+            const [snapshot, history] = await Promise.all([
+              fetchNyOpenFlowSnapshot(asset),
+              fetchNyOpenFlowHistory(asset),
+            ]);
+            return [asset, { snapshot, history }] as const;
+          } catch {
+            return [asset, { snapshot: null, history: [] }] as const;
+          }
+        }),
+      );
+
+      if (cancelled) {
+        return;
+      }
+
+      setNyOpenFlowByAsset(Object.fromEntries(results.map(([asset, value]) => [asset, value.snapshot])) as NyOpenFlowMap);
+      setNyOpenFlowHistoryByAsset(
+        Object.fromEntries(results.map(([asset, value]) => [asset, value.history])) as NyOpenFlowHistoryMap,
+      );
+    };
+
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [nyOpenFlowAssets, actusModeRefreshTick, selectedTimeframe]);
 
   useEffect(() => {
     writeLocalStorage(PRODUCT_HISTORY_KEY, setupHistory);
@@ -3293,6 +4330,7 @@ export default function App() {
     const now = Date.now();
     const currentStates: Record<string, ActusExecutionState> = {};
     const nextOpenSetups = { ...openSetupsRef.current };
+    const nextLaneActions: Record<string, ActusAction> = {};
 
     filteredOpportunities.forEach((item) => {
       const key = setupKey(item);
@@ -3313,6 +4351,8 @@ export default function App() {
       const status = stabilizeExecutionTransition(previousLifecycleRef.current[key], rawState);
       currentStates[key] = status;
       const previousStatus = previousLifecycleRef.current[key];
+      const previousLaneAction = previousLaneActionRef.current[key];
+      nextLaneActions[key] = item.action;
       const alertsEnabled = isAlertEnabledForAsset(productPrefs, item.symbol);
 
       if (alertsEnabled && shouldAlertExecutionTransition(previousStatus, status)) {
@@ -3329,6 +4369,35 @@ export default function App() {
             tone: nextAlert.tone,
             createdAt: now,
           });
+          alertTimestampsRef.current[throttleKey] = now;
+        }
+      }
+
+      if (alertsEnabled && productPrefs.executeAlertsEnabled && previousLaneAction !== "execute" && item.action === "execute") {
+        const throttleKey = `${key}-execute-appearance`;
+        const lastAlertAt = alertTimestampsRef.current[throttleKey] ?? 0;
+
+        if (now - lastAlertAt > ALERT_THROTTLE_MS) {
+          setInAppAlert({
+            id: `${throttleKey}-${now}`,
+            symbol: item.symbol,
+            title: item.direction === "short" ? `EXECUTE SHORT - ${item.symbol}` : `EXECUTE LONG - ${item.symbol}`,
+            body: item.actionLine,
+            tone: "active",
+            createdAt: now,
+            sound: "execute",
+          });
+          setInternalAlertEvents((current) => [
+            {
+              id: `${throttleKey}-${now}`,
+              asset: item.symbol,
+              timestamp: now,
+              eventType: "execute-appearance" as const,
+              snapshot: buildInternalAlertSnapshot(item),
+              previousSnapshot: null,
+            },
+            ...current,
+          ].slice(0, 40));
           alertTimestampsRef.current[throttleKey] = now;
         }
       }
@@ -3429,7 +4498,73 @@ export default function App() {
 
     openSetupsRef.current = nextOpenSetups;
     previousLifecycleRef.current = currentStates;
+    previousLaneActionRef.current = nextLaneActions;
   }, [closedPositions, filteredOpportunities, openPositions, productPrefs]);
+
+  useEffect(() => {
+    if (!productPrefs.browserAlertsEnabled || browserNotificationPermission !== "granted" || !inAppAlert || !shouldDeliverBrowserAlert()) {
+      return;
+    }
+
+    const notification = buildBrowserNotificationFromInAppAlert(inAppAlert);
+    const lastDeliveredAt = deliveredBrowserAlertIdsRef.current[notification.fingerprint] ?? 0;
+    if (Date.now() - lastDeliveredAt <= ALERT_THROTTLE_MS) {
+      return;
+    }
+
+    const instance = new window.Notification(notification.title, {
+      body: notification.body,
+      tag: notification.tag,
+    });
+    instance.onclick = () => {
+      window.focus();
+      instance.close();
+    };
+    deliveredBrowserAlertIdsRef.current[notification.fingerprint] = Date.now();
+  }, [browserNotificationPermission, inAppAlert, productPrefs.browserAlertsEnabled]);
+
+  useEffect(() => {
+    if (!inAppAlert || inAppAlert.sound !== "execute" || !productPrefs.executeSoundEnabled) {
+      return;
+    }
+
+    const fingerprint = `${inAppAlert.symbol}:${inAppAlert.title}:${inAppAlert.createdAt}`;
+    const lastPlayedAt = playedExecuteAlertSignaturesRef.current[fingerprint] ?? 0;
+    if (Date.now() - lastPlayedAt <= ALERT_THROTTLE_MS) {
+      return;
+    }
+
+    playExecuteAlertSound();
+    playedExecuteAlertSignaturesRef.current[fingerprint] = Date.now();
+  }, [inAppAlert, productPrefs.executeSoundEnabled]);
+
+  useEffect(() => {
+    if (
+      !productPrefs.browserAlertsEnabled ||
+      browserNotificationPermission !== "granted" ||
+      !internalAlertEvents.length ||
+      !shouldDeliverBrowserAlert()
+    ) {
+      return;
+    }
+
+    const latestEvent = internalAlertEvents[0];
+    const notification = buildBrowserNotificationFromInternalEvent(latestEvent);
+    const lastDeliveredAt = deliveredBrowserAlertIdsRef.current[notification.fingerprint] ?? 0;
+    if (Date.now() - lastDeliveredAt <= ALERT_THROTTLE_MS) {
+      return;
+    }
+
+    const instance = new window.Notification(notification.title, {
+      body: notification.body,
+      tag: notification.tag,
+    });
+    instance.onclick = () => {
+      window.focus();
+      instance.close();
+    };
+    deliveredBrowserAlertIdsRef.current[notification.fingerprint] = Date.now();
+  }, [browserNotificationPermission, internalAlertEvents, productPrefs.browserAlertsEnabled]);
 
   useEffect(() => {
     const now = Date.now();
@@ -3530,8 +4665,27 @@ export default function App() {
       avoid: filteredOpportunities.filter((item) => item.action === "avoid").slice().sort(byConfidence),
     };
   }, [filteredOpportunities]);
+  const focusGrouped = useMemo(() => {
+    const byConfidence = (a: ActusOpportunityOutput, b: ActusOpportunityOutput) =>
+      b.confidenceScore - a.confidenceScore || b.opportunityScore - a.opportunityScore || a.symbol.localeCompare(b.symbol);
+    const executeStates = new Set<ActusOpportunityOutput["state"]>(["execute"]);
+    const waitStates = new Set<ActusOpportunityOutput["state"]>(["waiting", "watching", "building"]);
+
+    return {
+      execute: filteredOpportunities.filter((item) => item.action === "execute" || executeStates.has(item.state)).slice().sort(byConfidence),
+      wait: filteredOpportunities
+        .filter((item) => (item.action === "wait" || waitStates.has(item.state)) && item.action !== "execute" && !executeStates.has(item.state))
+        .slice()
+        .sort(byConfidence),
+      avoid: filteredOpportunities
+        .filter((item) => item.action === "avoid" && !waitStates.has(item.state) && !executeStates.has(item.state))
+        .slice()
+        .sort(byConfidence),
+    };
+  }, [filteredOpportunities]);
 
   const filteredHero = useMemo(() => snapshot.hero ?? filteredOpportunities[0] ?? null, [filteredOpportunities, snapshot.hero]);
+  const actusModeSolView = useMemo(() => normalizeSolActusView(actusModeSelection), [actusModeSelection]);
   const actusModeLiveAsset = useMemo(
     () =>
       actusModeSelection
@@ -3539,14 +4693,20 @@ export default function App() {
         : null,
     [actusModeSelection, filteredOpportunities],
   );
-  const actusModeAsset = useMemo(() => {
+  const actusModeAsset = useMemo<ActusModeRenderableAsset | null>(() => {
     if (!actusModeSelection) {
       return null;
     }
+    const actusSourceKey = resolveActusModeSourceKey(actusModeLiveAsset ?? actusModeSelection.snapshot, actusModeSolView) ?? actusModeSelection.symbol;
+    const actusSourceLabel = actusSourceQualifier(actusModeSelection.symbol, actusModeSolView);
+    const actusChartSymbol = resolveActusModeChartSymbol(actusModeSelection.snapshot, actusModeSolView);
     if (!actusModeLiveAsset) {
       return {
         ...actusModeSelection.snapshot,
         timeframe: actusModeSelection.timeframe,
+        actusSourceKey,
+        actusSourceLabel,
+        actusChartSymbol,
       };
     }
 
@@ -3562,8 +4722,11 @@ export default function App() {
       summary: actusModeSelection.snapshot.summary,
       whyItMatters: actusModeSelection.snapshot.whyItMatters,
       contextLine: actusModeSelection.snapshot.contextLine,
+      actusSourceKey,
+      actusSourceLabel,
+      actusChartSymbol,
     };
-  }, [actusModeLiveAsset, actusModeSelection]);
+  }, [actusModeLiveAsset, actusModeSelection, actusModeSolView]);
   useEffect(() => {
     if (!actusModeSelection || actusModeSelection.timeframe === selectedTimeframe) {
       return;
@@ -3582,7 +4745,10 @@ export default function App() {
         : current,
     );
   }, [actusModeSelection, selectedTimeframe]);
-  const actusModeStreamAsset = useMemo(() => resolveActusLiveAsset(actusModeAsset), [actusModeAsset]);
+  const actusModeStreamAsset = useMemo(
+    () => resolveActusLiveAsset(actusModeAsset, actusModeSolView),
+    [actusModeAsset, actusModeSolView],
+  );
 
   useEffect(() => {
     if (!actusModeAsset) {
@@ -3616,7 +4782,7 @@ export default function App() {
       connected: false,
       historyResolved: false,
       sparkline: actusModeAsset.sparkline,
-      candles: null,
+      candles: supportsSparklineBootstrap(actusModeStreamAsset) ? buildSparklineFallbackCandles(actusModeAsset) : null,
       price: actusModeAsset.price,
       updatedAt: null,
     });
@@ -3634,7 +4800,7 @@ export default function App() {
 
     const cleanupEventSource = () => {
       eventSource?.removeEventListener("ready", handleReady as EventListener);
-      eventSource?.removeEventListener("candles", handleCandles as EventListener);
+      eventSource?.removeEventListener("snapshot", handleSnapshot as EventListener);
       eventSource?.removeEventListener("error", handleError as EventListener);
       eventSource?.close();
       eventSource = null;
@@ -3657,20 +4823,29 @@ export default function App() {
       }));
     };
 
-    const handleCandles = (event: MessageEvent<string>) => {
+    const handleSnapshot = (event: MessageEvent<string>) => {
       try {
-        const payload = JSON.parse(event.data) as LiveDatabentoCandle[];
-        const latest = Array.isArray(payload) ? payload[payload.length - 1] : null;
-        if (!latest) return;
+        const payload = JSON.parse(event.data) as {
+          ok: boolean;
+          asset: string;
+          timeframe: TimeframeFilter;
+          snapshot: ActusLiveChartSnapshot;
+        };
+        const snapshot = payload?.snapshot ?? null;
+        if (!snapshot) return;
 
-        const close = readLiveCandleClose(latest);
-        if (close === null) return;
-        const normalized = normalizeLiveCandle(latest, actusModeStreamAsset, actusModeAsset.timeframe);
+        const normalized = snapshot.candle ? normalizeLiveCandle(snapshot.candle, actusModeStreamAsset, actusModeAsset.timeframe) : null;
+        const livePrice =
+          typeof snapshot.livePrice === "number" && Number.isFinite(snapshot.livePrice)
+            ? snapshot.livePrice
+            : normalized
+              ? normalized.close
+              : null;
 
         setActusModeLiveChart((current) => {
           const historyLimit = actusHistoryLimit();
           const baseSeries = current.sparkline?.length ? current.sparkline : actusModeAsset.sparkline;
-          const nextCandles = normalized
+          const mergedCandles = normalized
             ? mergeActusLiveCandleSeries(
                 current.candles,
                 normalized,
@@ -3679,19 +4854,36 @@ export default function App() {
                 historyLimit,
               )
             : current.candles;
-            return {
-              supported: true,
-              connected: true,
-              historyResolved: current.historyResolved,
-              sparkline: nextCandles?.length ? nextCandles.slice(-32).map((candle) => candle.close) : [...baseSeries.slice(-31), close],
-              candles: nextCandles ?? null,
-              price: close,
-              updatedAt: Date.now(),
+          const nextCandles = evolveActusActiveCandleFromLivePrice(mergedCandles, {
+            asset: actusModeStreamAsset,
+            timeframe: actusModeAsset.timeframe,
+            livePrice,
+            updatedAt: snapshot.updatedAt ?? null,
+          });
+          const fallbackSparkline =
+            livePrice !== null ? [...baseSeries.slice(-31), livePrice] : baseSeries;
+          return {
+            supported: true,
+            connected: true,
+            historyResolved: current.historyResolved,
+            sparkline: nextCandles?.length ? nextCandles.slice(-32).map((candle) => candle.close) : fallbackSparkline,
+            candles: nextCandles ?? current.candles,
+            price: livePrice ?? current.price,
+            updatedAt: snapshot.updatedAt ? Date.parse(snapshot.updatedAt) || Date.now() : Date.now(),
           };
         });
+        if (actusModeAsset.symbol.toUpperCase() === "NQ") {
+          console.info("[ACTUS][R14][NQ][frontend-live]", {
+            incomingLivePrice: livePrice,
+            incomingLiveTimestamp: snapshot.updatedAt ?? null,
+            incomingLiveSymbol: snapshot.liveSymbol ?? null,
+            candleTimestamp: normalized?.timestamp ?? snapshot.candle?.timestamp ?? null,
+            displayedPrice: livePrice,
+          });
+        }
       } catch {
-        Sentry.captureException(new Error("ACTUS Mode live candle parse failed"), {
-          tags: { scope: "actus-live-candle-parse", symbol: actusModeAsset.symbol, timeframe: actusModeAsset.timeframe },
+        Sentry.captureException(new Error("ACTUS Mode live chart snapshot parse failed"), {
+          tags: { scope: "actus-live-chart-parse", symbol: actusModeAsset.symbol, timeframe: actusModeAsset.timeframe },
         });
         setActusModeLiveChart((current) => ({
           ...current,
@@ -3712,10 +4904,10 @@ export default function App() {
     const connectLive = () => {
       cleanupEventSource();
       eventSource = new EventSource(
-        `${API_BASE}/api/databento/futures/live?assets=${encodeURIComponent(actusModeStreamAsset)}&timeframe=${encodeURIComponent(actusModeAsset.timeframe)}`,
+        `${API_BASE}/api/actus/live-chart?asset=${encodeURIComponent(actusModeStreamAsset)}&timeframe=${encodeURIComponent(actusModeAsset.timeframe)}`,
       );
       eventSource.addEventListener("ready", handleReady as EventListener);
-      eventSource.addEventListener("candles", handleCandles as EventListener);
+      eventSource.addEventListener("snapshot", handleSnapshot as EventListener);
       eventSource.addEventListener("error", handleError as EventListener);
       eventSource.onerror = handleError;
     };
@@ -3723,6 +4915,39 @@ export default function App() {
     const loadHistory = async () => {
       const historyLimit = actusHistoryLimit();
       const minimumHistory = minimumActusHistoryCandles();
+      if (!isDatabentoLiveAsset(actusModeStreamAsset)) {
+        let sourceHistoryCandles: NormalizedFuturesCandle[] = [];
+        try {
+          sourceHistoryCandles = await fetchActusSourceHistory({
+            asset: actusModeStreamAsset,
+            timeframe: actusModeAsset.timeframe,
+            limit: historyLimit,
+          });
+        } catch (error) {
+          if (!cancelled) {
+            setActusModeLiveChart((current) => ({
+              ...current,
+              historyResolved: true,
+              candles: null,
+              updatedAt: current.updatedAt ?? Date.now(),
+            }));
+          }
+          throw error;
+        }
+        if (!cancelled) {
+          const fallbackPrice =
+            sourceHistoryCandles.length ? sourceHistoryCandles[sourceHistoryCandles.length - 1]?.close ?? null : null;
+          setActusModeLiveChart((current) => ({
+            ...current,
+            historyResolved: true,
+            candles: sourceHistoryCandles.length ? sourceHistoryCandles : null,
+            sparkline: sourceHistoryCandles.length ? sourceHistoryCandles.slice(-32).map((candle) => candle.close) : current.sparkline,
+            price: current.price ?? fallbackPrice,
+            updatedAt: current.updatedAt ?? Date.now(),
+          }));
+        }
+        return;
+      }
       const initialCandles = await ensureActusCandleDepth({
         asset: actusModeStreamAsset,
         displaySymbol: actusModeAsset.symbol,
@@ -3736,8 +4961,8 @@ export default function App() {
             historyResolved: true,
             candles: initialCandles.slice(-historyLimit),
             sparkline: initialCandles.slice(-32).map((candle) => candle.close),
-            price: initialCandles[initialCandles.length - 1]?.close ?? current.price,
-            updatedAt: Date.now(),
+            price: current.price ?? initialCandles[initialCandles.length - 1]?.close ?? null,
+            updatedAt: current.updatedAt ?? Date.now(),
         }));
       }
 
@@ -3755,8 +4980,8 @@ export default function App() {
               historyResolved: true,
               candles: fallbackCandles.slice(-historyLimit),
               sparkline: fallbackCandles.slice(-32).map((candle) => candle.close),
-              price: fallbackCandles[fallbackCandles.length - 1]?.close ?? current.price,
-              updatedAt: Date.now(),
+              price: current.price ?? fallbackCandles[fallbackCandles.length - 1]?.close ?? null,
+              updatedAt: current.updatedAt ?? Date.now(),
             }));
           }
         }
@@ -3770,6 +4995,7 @@ export default function App() {
       };
 
     const bootstrapChart = async () => {
+      connectLive();
       try {
         await loadHistory();
       } catch (error) {
@@ -3778,10 +5004,6 @@ export default function App() {
           tags: { scope: "actus-mode-history-bootstrap", symbol: actusModeAsset.symbol, timeframe: actusModeAsset.timeframe },
         });
         scheduleReconnect();
-      } finally {
-        if (!cancelled) {
-          connectLive();
-        }
       }
     };
 
@@ -3792,7 +5014,7 @@ export default function App() {
       clearReconnectTimer();
       cleanupEventSource();
     };
-  }, [actusModeAsset?.symbol, actusModeAsset?.timeframe, actusModeStreamAsset]);
+  }, [actusModeAsset?.symbol, actusModeAsset?.timeframe, actusModeRefreshTick, actusModeStreamAsset]);
 
   const actusModeLiveDisplayAsset = useMemo(
     () =>
@@ -3806,13 +5028,25 @@ export default function App() {
         : null,
     [actusModeAsset, actusModeLiveChart.price, actusModeLiveChart.sparkline],
   );
+  const actusModeSignalAsset = useMemo(
+    () =>
+      actusModeLiveDisplayAsset
+        ? {
+            ...actusModeLiveDisplayAsset,
+            symbol: actusModeLiveDisplayAsset.actusSourceKey ?? actusModeLiveDisplayAsset.symbol,
+          }
+        : null,
+    [actusModeLiveDisplayAsset],
+  );
   const actusModeBaseChartCandles = useMemo(() => {
     if (hasRenderableActusCandles(actusModeLiveChart.candles)) {
       return actusModeLiveChart.candles;
     }
 
     const fallbackCandles =
-      actusModeLiveDisplayAsset && hasRenderableActusSparkline(actusModeLiveDisplayAsset.sparkline)
+      supportsSparklineBootstrap(actusModeStreamAsset) &&
+      actusModeLiveDisplayAsset &&
+      hasRenderableActusSparkline(actusModeLiveDisplayAsset.sparkline)
         ? buildSparklineFallbackCandles(actusModeLiveDisplayAsset)
         : null;
 
@@ -3825,7 +5059,7 @@ export default function App() {
     }
 
     return null;
-  }, [actusModeLiveDisplayAsset, actusModeLiveChart.candles, actusModeLiveChart.historyResolved, actusModeLiveChart.supported]);
+  }, [actusModeLiveDisplayAsset, actusModeLiveChart.candles, actusModeLiveChart.historyResolved, actusModeLiveChart.supported, actusModeStreamAsset]);
 
   const actusReplayAvailable = Boolean(actusModeBaseChartCandles && actusModeBaseChartCandles.length > 1);
   const actusReplaySourceCandles = useMemo(() => {
@@ -3904,6 +5138,15 @@ export default function App() {
       return;
     }
 
+    if (!isDatabentoLiveAsset(actusModeStreamAsset)) {
+      setActusReplayHistory({
+        loading: false,
+        candles: actusModeBaseChartCandles ?? null,
+        resolved: true,
+      });
+      return;
+    }
+
     if (actusReplayHistory.resolved || actusReplayHistory.loading) {
       return;
     }
@@ -3955,6 +5198,7 @@ export default function App() {
   }, [
     actusModeAsset,
     actusModeBaseChartCandles,
+    actusModeRefreshTick,
     actusModeStreamAsset,
     actusReplayHistory.loading,
     actusReplayHistory.resolved,
@@ -3985,92 +5229,73 @@ export default function App() {
 
     return () => window.clearTimeout(timer);
   }, [actusReplaySourceCandles, actusReplayState.isPlaying, actusReplayState.isReplayMode, actusReplayState.replayIndex, actusReplayState.replaySpeed]);
-  useEffect(() => {
-    const traceKey = actusTraceDepthKey(actusModeAsset?.symbol, actusModeAsset?.timeframe ?? null);
-    if (!traceKey) {
-      return;
-    }
-
-    console.info("[ACTUS][DEPTH HANDOFF]", {
-      asset: traceKey,
-      chosenSource: hasRenderableActusCandles(actusModeLiveChart.candles)
-        ? "supported"
-        : actusModeDisplayAsset && hasRenderableActusSparkline(actusModeDisplayAsset.sparkline)
-          ? "fallback"
-          : "none",
-      supportedCount: actusModeLiveChart.candles?.length ?? 0,
-      finalActusModeCount: actusModeChartCandles?.length ?? 0,
-      historyResolved: actusModeLiveChart.historyResolved,
-      usingFallback: !hasRenderableActusCandles(actusModeLiveChart.candles),
-      firstSupportedTimestamp: actusModeLiveChart.candles?.[0]?.timestamp ?? null,
-      lastSupportedTimestamp: actusModeLiveChart.candles?.[actusModeLiveChart.candles.length - 1]?.timestamp ?? null,
-      firstFinalTimestamp: actusModeChartCandles?.[0]?.timestamp ?? null,
-      lastFinalTimestamp: actusModeChartCandles?.[actusModeChartCandles.length - 1]?.timestamp ?? null,
-    });
-  }, [actusModeAsset?.symbol, actusModeAsset?.timeframe, actusModeChartCandles, actusModeLiveChart.candles, actusModeLiveChart.historyResolved]);
   const actusModePosition = useMemo(
     () => (actusReplayState.isReplayMode || !actusModeDisplayAsset ? null : openPositions[setupKey(actusModeDisplayAsset)] ?? null),
     [actusModeDisplayAsset, actusReplayState.isReplayMode, openPositions],
   );
   useEffect(() => {
     let cancelled = false;
+    const liveAssetKey = actusModeSignalAsset ? `${actusModeSignalAsset.symbol}:${actusModeSignalAsset.timeframe}` : null;
 
-    if (!actusModeLiveDisplayAsset) {
+    if (!actusModeSignalAsset) {
       setActusModeGammaBase(null);
+      actusModeGammaKeyRef.current = null;
       return;
     }
 
-    setActusModeGammaBase(null);
+    if (actusModeGammaKeyRef.current && actusModeGammaKeyRef.current !== liveAssetKey) {
+      setActusModeGammaBase(null);
+    }
 
-    void resolveActusGammaOverlay(actusModeLiveDisplayAsset)
+    void resolveActusGammaOverlay(actusModeSignalAsset)
       .then((overlay) => {
         if (!cancelled) {
           setActusModeGammaBase(overlay);
+          actusModeGammaKeyRef.current = liveAssetKey;
         }
       })
       .catch((error) => {
         Sentry.captureException(error, {
-          tags: { scope: "actus-gamma-overlay", symbol: actusModeLiveDisplayAsset.symbol },
+          tags: { scope: "actus-gamma-overlay", symbol: actusModeSignalAsset.symbol },
         });
-        if (!cancelled) {
-          setActusModeGammaBase(null);
-        }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [actusModeLiveDisplayAsset?.symbol, actusModeLiveDisplayAsset?.timeframe, actusModeLiveDisplayAsset?.price]);
+  }, [actusModeRefreshTick, actusModeSignalAsset]);
 
   useEffect(() => {
     let cancelled = false;
+    const liveAssetKey = actusModeSignalAsset ? `${actusModeSignalAsset.symbol}:${actusModeSignalAsset.timeframe}` : null;
 
-    if (!actusModeLiveDisplayAsset) {
+    if (!actusModeSignalAsset) {
       setActusModeDeltaSignal(null);
+      actusModeDeltaKeyRef.current = null;
       return;
     }
 
-    setActusModeDeltaSignal(null);
+    if (actusModeDeltaKeyRef.current && actusModeDeltaKeyRef.current !== liveAssetKey) {
+      setActusModeDeltaSignal(null);
+    }
 
-    void resolveActusDeltaSignal(actusModeLiveDisplayAsset)
+    void resolveActusDeltaSignal(actusModeSignalAsset)
       .then((signal) => {
         if (!cancelled) {
           setActusModeDeltaSignal(signal);
+          actusModeDeltaKeyRef.current = liveAssetKey;
         }
       })
       .catch((error) => {
         Sentry.captureException(error, {
-          tags: { scope: "actus-delta-signal", symbol: actusModeLiveDisplayAsset.symbol },
+          tags: { scope: "actus-delta-signal", symbol: actusModeSignalAsset.symbol },
         });
-        if (!cancelled) {
-          setActusModeDeltaSignal(null);
-        }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [actusModeLiveDisplayAsset?.symbol, actusModeLiveDisplayAsset?.timeframe, actusModeLiveDisplayAsset?.price]);
+  }, [actusModeRefreshTick, actusModeSignalAsset]);
 
   const actusModeGammaOverlay = useMemo(
     () =>
@@ -4097,61 +5322,15 @@ export default function App() {
     () => (actusModeDisplayAsset ? deriveActusPositioning(actusModeDisplayAsset, actusModeGammaOverlay, actusModeEffectiveDeltaSignal) : null),
     [actusModeEffectiveDeltaSignal, actusModeDisplayAsset, actusModeGammaOverlay],
   );
-  const actusModeChartGammaOverlay = useMemo(
-    () =>
-      actusModeDisplayAsset
-        ? buildActusChartGammaOverlay(actusModeDisplayAsset, actusModeUnifiedPositioning, actusModeGammaOverlay)
-        : null,
-    [actusModeDisplayAsset, actusModeGammaOverlay, actusModeUnifiedPositioning],
-  );
-  useEffect(() => {
-    if (!actusModeDisplayAsset) {
-      return;
-    }
-
-    const normalizedSymbol = actusModeDisplayAsset.symbol.toUpperCase();
-    const traceSymbol =
-      normalizedSymbol === "XAU/USD" ? "XAU" : normalizedSymbol === "CL" ? "OIL" : normalizedSymbol;
-    if (!["NQ", "XAU", "OIL"].includes(traceSymbol)) {
-      return;
-    }
-
-    console.info("[ACTUS][OVERLAY HANDOFF]", {
-      asset: `${traceSymbol} ${actusModeDisplayAsset.timeframe}`,
-      positioningType: actusModeUnifiedPositioning?.positioningType ?? "NONE",
-      gammaSourceAvailable: actusModeUnifiedPositioning?.gammaSourceAvailable ?? false,
-      gammaLevelsAvailable: actusModeUnifiedPositioning?.gammaLevelsAvailable ?? false,
-      gammaDirectionalAvailable: actusModeUnifiedPositioning?.gammaDirectionalAvailable ?? false,
-      gammaFlip: actusModeChartGammaOverlay?.gammaFlip ?? null,
-      callWall: actusModeChartGammaOverlay?.callWall ?? null,
-      putWall: actusModeChartGammaOverlay?.putWall ?? null,
-      anchor: actusModeChartGammaOverlay?.anchor ?? null,
-      spotReference: actusModeChartGammaOverlay?.spotReference ?? null,
-      source: actusModeChartGammaOverlay?.source ?? null,
-    });
-  }, [actusModeChartGammaOverlay, actusModeDisplayAsset, actusModeUnifiedPositioning]);
-  useEffect(() => {
-    const traceKey = actusTraceDepthKey(actusModeAsset?.symbol, actusModeAsset?.timeframe ?? null);
-    if (!traceKey) {
-      return;
-    }
-
-    console.info("[ACTUS][DELTA]", {
-      asset: traceKey,
-      deltaSourceAvailable: actusModeDeltaSignal?.deltaSourceAvailable ?? false,
-      deltaDirectionalAvailable: actusModeDeltaSignal?.deltaDirectionalAvailable ?? false,
-      bias: actusModeDeltaSignal?.bias ?? null,
-      strength: actusModeDeltaSignal?.strength ?? null,
-      condition: actusModeDeltaSignal?.condition ?? null,
-      source: actusModeDeltaSignal?.source ?? null,
-      updatedAt: actusModeDeltaSignal?.updatedAt ?? null,
-    });
-  }, [actusModeAsset?.symbol, actusModeAsset?.timeframe, actusModeDeltaSignal]);
   const actusModeClosedPosition = useMemo(
     () => (actusReplayState.isReplayMode || !actusModeDisplayAsset ? null : closedPositions[setupKey(actusModeDisplayAsset)] ?? null),
     [actusModeDisplayAsset, actusReplayState.isReplayMode, closedPositions],
   );
   useEffect(() => {
+    if (!productPrefs.alertsEnabled) {
+      return;
+    }
+
     const nextSnapshots: Record<string, ActusInternalAlertSnapshot> = {};
     const nextEvents: ActusInternalAlertEvent[] = [];
     const now = Date.now();
@@ -4194,10 +5373,9 @@ export default function App() {
     previousInternalAlertStateRef.current = nextSnapshots;
 
     if (nextEvents.length) {
-      console.info("[ACTUS][INTERNAL ALERTS]", nextEvents);
       setInternalAlertEvents((current) => [...nextEvents, ...current].slice(0, 40));
     }
-  }, [filteredOpportunities, actusModeDisplayAsset, actusModeEffectiveDeltaSignal, actusModeUnifiedPositioning]);
+  }, [filteredOpportunities, actusModeDisplayAsset, actusModeEffectiveDeltaSignal, actusModeUnifiedPositioning, productPrefs.alertsEnabled]);
 
   const filteredRanked = useMemo(
     () =>
@@ -4217,15 +5395,6 @@ export default function App() {
           summary: item.summary,
         })),
     [filteredOpportunities],
-  );
-
-  const filteredCounts = useMemo(
-    () => ({
-      wait: grouped.wait.length,
-      execute: grouped.execute.length,
-      avoid: grouped.avoid.length,
-    }),
-    [grouped.avoid.length, grouped.execute.length, grouped.wait.length],
   );
 
   const commandPanel = useMemo(() => {
@@ -4306,7 +5475,10 @@ export default function App() {
   const lastUpdatedText = updateLabel(snapshot.status.mode, snapshot.status.health, snapshot.status.lastUpdatedLabel);
 
   const openActusMode = (symbol: string) => {
-    const selected = filteredOpportunities.find((item) => item.symbol === symbol) ?? (hero?.symbol === symbol ? hero : null);
+    const candidateSymbols = actusModeSelectionSymbolCandidates(symbol);
+    const selected =
+      filteredOpportunities.find((item) => candidateSymbols.includes(item.symbol.toUpperCase())) ??
+      (hero && candidateSymbols.includes(hero.symbol.toUpperCase()) ? hero : null);
     if (!selected) {
       return;
     }
@@ -4318,7 +5490,33 @@ export default function App() {
         ...selected,
         timeframe: selectedTimeframe,
       },
+      solView: isSolActusSymbol(selected.symbol) ? "binance-execution" : undefined,
     });
+  };
+
+  const handleSolActusViewChange = (nextView: SolActusView) => {
+    if (!actusModeSelection || !isSolActusSymbol(actusModeSelection.symbol) || normalizeSolActusView(actusModeSelection) === nextView) {
+      return;
+    }
+
+    clearActusGammaOverlayCache();
+    clearActusDeltaSignalCache();
+    setActusReplayHistory({
+      loading: false,
+      candles: null,
+      resolved: false,
+    });
+    setActusModeLiveChart({
+      supported: true,
+      connected: false,
+      historyResolved: false,
+      sparkline: null,
+      candles: null,
+      price: null,
+      updatedAt: null,
+    });
+    setActusModeSelection((current) => (current ? { ...current, solView: nextView } : current));
+    setActusModeRefreshTick((tick) => tick + 1);
   };
 
   const toggleActusReplayMode = () => {
@@ -4529,6 +5727,61 @@ export default function App() {
     }));
   };
 
+  const toggleAlertsEnabled = () => {
+    setProductPrefs((current) => ({
+      ...current,
+      alertsEnabled: !current.alertsEnabled,
+    }));
+  };
+
+  const toggleExecuteAlertsEnabled = () => {
+    setProductPrefs((current) => ({
+      ...current,
+      executeAlertsEnabled: !current.executeAlertsEnabled,
+    }));
+  };
+
+  const requestBrowserNotifications = async () => {
+    if (!browserNotificationsSupported()) {
+      setBrowserNotificationPermission("unsupported");
+      return;
+    }
+
+    const currentPermission = currentBrowserNotificationPermission();
+    if (currentPermission === "granted") {
+      setBrowserNotificationPermission("granted");
+      setProductPrefs((current) => ({ ...current, browserAlertsEnabled: true }));
+      return;
+    }
+
+    const nextPermission = await window.Notification.requestPermission();
+    setBrowserNotificationPermission(nextPermission);
+    if (nextPermission === "granted") {
+      setProductPrefs((current) => ({ ...current, browserAlertsEnabled: true }));
+    }
+  };
+
+  const toggleBrowserAlerts = async () => {
+    if (!browserNotificationsSupported()) {
+      setBrowserNotificationPermission("unsupported");
+      return;
+    }
+
+    if (productPrefs.browserAlertsEnabled) {
+      setProductPrefs((current) => ({ ...current, browserAlertsEnabled: false }));
+      return;
+    }
+
+    await requestBrowserNotifications();
+  };
+
+  const toggleExecuteSound = () => {
+    setProductPrefs((current) => ({
+      ...current,
+      executeSoundEnabled: !current.executeSoundEnabled,
+    }));
+  };
+
   const updateWorkflowNote = (symbol: string, note: string) => {
     setProductPrefs((current) => ({
       ...current,
@@ -4537,6 +5790,41 @@ export default function App() {
         [symbol]: note,
       },
     }));
+  };
+
+  const browserAlertStatusLabel =
+    browserNotificationPermission === "unsupported"
+      ? "Unsupported"
+      : browserNotificationPermission === "granted"
+        ? productPrefs.browserAlertsEnabled
+          ? "Enabled"
+          : "Ready"
+        : browserNotificationPermission === "denied"
+          ? "Blocked"
+          : "Permission needed";
+  const masterAlertStatusLabel = productPrefs.alertsEnabled ? "On" : "Off";
+  const executeAlertStatusLabel = productPrefs.executeAlertsEnabled ? "On" : "Off";
+  const soundStatusLabel = productPrefs.executeSoundEnabled ? "On" : "Off";
+
+  const handleHeaderRefresh = async () => {
+    if (actusModeSelection) {
+      clearDatabentoFuturesHistoryCache();
+      clearActusGammaOverlayCache();
+      clearActusDeltaSignalCache();
+      setActusReplayHistory({
+        loading: false,
+        candles: null,
+        resolved: false,
+      });
+      setActusModeLiveChart((current) => ({
+        ...current,
+        connected: false,
+        historyResolved: false,
+      }));
+      setActusModeRefreshTick((tick) => tick + 1);
+    }
+
+    await refresh({ force: true });
   };
 
   return (
@@ -4639,7 +5927,7 @@ export default function App() {
             </div>
             {badge("Decision Engine", "#d7e1f4", "rgba(255,255,255,0.03)", "rgba(142,160,191,0.14)")}
             {badge(lastUpdatedText, snapshot.status.health === "healthy" ? "#9ecdb6" : "#8ea0bf", "rgba(255,255,255,0.03)", "rgba(142,160,191,0.14)")}
-            <button type="button" onClick={() => void refresh({ force: true })} style={{ border: "1px solid rgba(142,160,191,0.12)", background: "linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.015))", color: "#b8c6de", borderRadius: 999, padding: "9px 14px", cursor: "pointer", fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.02)" }}>
+            <button type="button" onClick={() => void handleHeaderRefresh()} style={{ border: "1px solid rgba(142,160,191,0.12)", background: "linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.015))", color: "#b8c6de", borderRadius: 999, padding: "9px 14px", cursor: "pointer", fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.02)" }}>
               Refresh
             </button>
           </div>
@@ -4653,6 +5941,10 @@ export default function App() {
               actusModeChartCandles,
               actusModeGammaOverlay,
               actusModeEffectiveDeltaSignal,
+              (() => {
+                const flowAsset = mapSymbolToNyOpenFlowAsset(actusModeDisplayAsset.symbol);
+                return flowAsset ? nyOpenFlowByAsset[flowAsset] ?? null : null;
+              })(),
               actusReplayState,
               nowTick,
               () => setActusModeSelection(null),
@@ -4667,9 +5959,182 @@ export default function App() {
               updateFillPriceDraft,
               markOrderFilled,
               closePosition,
+              ACTUS_MODE_ASSET_UNIVERSE,
+              openActusMode,
+              actusModeSolView,
+              handleSolActusViewChange,
               )
             : null}
           {!showFirstLoadSkeleton && !actusModeDisplayAsset && hero ? heroSignalCard(hero, nowTick, openActusMode) : null}
+          {!showFirstLoadSkeleton && !actusModeDisplayAsset ? (
+            <section
+              style={{
+                background: "linear-gradient(145deg, rgba(10,17,31,0.98), rgba(7,12,22,0.96))",
+                border: "1px solid rgba(132,151,186,0.16)",
+                borderRadius: 24,
+                padding: 18,
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)",
+                display: "grid",
+                gap: 14,
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>Alert Controls</div>
+                  <div style={{ marginTop: 6, fontSize: 18, fontWeight: 700, color: "#f4f7fb" }}>Core alert visibility and delivery</div>
+                </div>
+                {badge(productPrefs.alertsEnabled ? "Alerts Enabled" : "Alerts Muted", productPrefs.alertsEnabled ? "#45ffb5" : "#ff8ea8", productPrefs.alertsEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,111,145,0.08)", productPrefs.alertsEnabled ? "rgba(69,255,181,0.28)" : "rgba(255,111,145,0.24)")}
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
+                <div style={{ padding: "12px 14px", borderRadius: 14, background: "rgba(255,255,255,0.018)", border: "1px solid rgba(132,151,186,0.1)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                    <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Alerts</div>
+                    {badge(masterAlertStatusLabel, productPrefs.alertsEnabled ? "#45ffb5" : "#ff8ea8", productPrefs.alertsEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,111,145,0.08)", productPrefs.alertsEnabled ? "rgba(69,255,181,0.28)" : "rgba(255,111,145,0.24)")}
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 13, color: "#d7e1f4", lineHeight: 1.45 }}>
+                    Master control for in-app execution and management alerts.
+                  </div>
+                  <button
+                    type="button"
+                    onClick={toggleAlertsEnabled}
+                    style={{
+                      marginTop: 12,
+                      border: productPrefs.alertsEnabled ? "1px solid rgba(69,255,181,0.3)" : "1px solid rgba(142,160,191,0.16)",
+                      background: productPrefs.alertsEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,255,255,0.02)",
+                      color: productPrefs.alertsEnabled ? "#45ffb5" : "#d7e1f4",
+                      borderRadius: 999,
+                      padding: "8px 12px",
+                      cursor: "pointer",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      letterSpacing: "0.08em",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    {productPrefs.alertsEnabled ? "Turn Alerts Off" : "Turn Alerts On"}
+                  </button>
+                </div>
+
+                <div style={{ padding: "12px 14px", borderRadius: 14, background: "rgba(255,255,255,0.018)", border: "1px solid rgba(132,151,186,0.1)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                    <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Execute Alerts</div>
+                    {badge(executeAlertStatusLabel, productPrefs.executeAlertsEnabled ? "#45ffb5" : "#ff8ea8", productPrefs.executeAlertsEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,111,145,0.08)", productPrefs.executeAlertsEnabled ? "rgba(69,255,181,0.28)" : "rgba(255,111,145,0.24)")}
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 13, color: "#d7e1f4", lineHeight: 1.45 }}>
+                    Controls first-entry EXECUTE appearance alerts without changing the execute logic itself.
+                  </div>
+                  <button
+                    type="button"
+                    onClick={toggleExecuteAlertsEnabled}
+                    style={{
+                      marginTop: 12,
+                      border: productPrefs.executeAlertsEnabled ? "1px solid rgba(69,255,181,0.3)" : "1px solid rgba(142,160,191,0.16)",
+                      background: productPrefs.executeAlertsEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,255,255,0.02)",
+                      color: productPrefs.executeAlertsEnabled ? "#45ffb5" : "#d7e1f4",
+                      borderRadius: 999,
+                      padding: "8px 12px",
+                      cursor: "pointer",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      letterSpacing: "0.08em",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    {productPrefs.executeAlertsEnabled ? "Turn Execute Alerts Off" : "Turn Execute Alerts On"}
+                  </button>
+                </div>
+
+                <div style={{ padding: "12px 14px", borderRadius: 14, background: "rgba(255,255,255,0.018)", border: "1px solid rgba(132,151,186,0.1)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                    <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Sound</div>
+                    {badge(soundStatusLabel, productPrefs.executeSoundEnabled ? "#45ffb5" : "#d7e1f4", productPrefs.executeSoundEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,255,255,0.03)", productPrefs.executeSoundEnabled ? "rgba(69,255,181,0.28)" : "rgba(142,160,191,0.14)")}
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 13, color: "#d7e1f4", lineHeight: 1.45 }}>
+                    Premium single-tone cue for execute appearance only.
+                  </div>
+                  <button
+                    type="button"
+                    onClick={toggleExecuteSound}
+                    style={{
+                      marginTop: 12,
+                      border: productPrefs.executeSoundEnabled ? "1px solid rgba(69,255,181,0.3)" : "1px solid rgba(142,160,191,0.16)",
+                      background: productPrefs.executeSoundEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,255,255,0.02)",
+                      color: productPrefs.executeSoundEnabled ? "#45ffb5" : "#d7e1f4",
+                      borderRadius: 999,
+                      padding: "8px 12px",
+                      cursor: "pointer",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      letterSpacing: "0.08em",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    {productPrefs.executeSoundEnabled ? "Turn Sound Off" : "Turn Sound On"}
+                  </button>
+                </div>
+
+                <div style={{ padding: "12px 14px", borderRadius: 14, background: "rgba(255,255,255,0.018)", border: "1px solid rgba(132,151,186,0.1)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                    <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.1em", textTransform: "uppercase" }}>Notifications</div>
+                    {badge(browserAlertStatusLabel.toUpperCase(), browserNotificationPermission === "denied" ? "#ff8ea8" : browserNotificationPermission === "granted" && productPrefs.browserAlertsEnabled ? "#45ffb5" : "#d7e1f4", browserNotificationPermission === "denied" ? "rgba(255,111,145,0.08)" : browserNotificationPermission === "granted" && productPrefs.browserAlertsEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,255,255,0.03)", browserNotificationPermission === "denied" ? "rgba(255,111,145,0.24)" : browserNotificationPermission === "granted" && productPrefs.browserAlertsEnabled ? "rgba(69,255,181,0.28)" : "rgba(142,160,191,0.14)")}
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 13, color: "#d7e1f4", lineHeight: 1.45 }}>
+                    {browserNotificationPermission === "denied"
+                      ? "Browser permission is blocked. Re-enable notifications in the browser first."
+                      : browserNotificationPermission === "unsupported"
+                        ? "This browser does not support system notifications."
+                        : productPrefs.browserAlertsEnabled
+                          ? "External notifications are enabled for off-screen ACTUS alerts."
+                          : "Enable notifications to receive alerts when ACTUS is in the background."}
+                  </div>
+                  <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {browserNotificationPermission !== "granted" ? (
+                      <button
+                        type="button"
+                        onClick={() => void requestBrowserNotifications()}
+                        disabled={browserNotificationPermission === "unsupported"}
+                        style={{
+                          border: "1px solid rgba(103,183,255,0.24)",
+                          background: "rgba(103,183,255,0.08)",
+                          color: "#67b7ff",
+                          borderRadius: 999,
+                          padding: "8px 12px",
+                          cursor: browserNotificationPermission === "unsupported" ? "default" : "pointer",
+                          fontSize: 11,
+                          fontWeight: 700,
+                          letterSpacing: "0.08em",
+                          textTransform: "uppercase",
+                          opacity: browserNotificationPermission === "unsupported" ? 0.55 : 1,
+                        }}
+                      >
+                        Enable Notifications
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void toggleBrowserAlerts()}
+                        style={{
+                          border: productPrefs.browserAlertsEnabled ? "1px solid rgba(69,255,181,0.3)" : "1px solid rgba(142,160,191,0.16)",
+                          background: productPrefs.browserAlertsEnabled ? "rgba(69,255,181,0.08)" : "rgba(255,255,255,0.02)",
+                          color: productPrefs.browserAlertsEnabled ? "#45ffb5" : "#d7e1f4",
+                          borderRadius: 999,
+                          padding: "8px 12px",
+                          cursor: "pointer",
+                          fontSize: 11,
+                          fontWeight: 700,
+                          letterSpacing: "0.08em",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        {productPrefs.browserAlertsEnabled ? "Turn Notifications Off" : "Turn Notifications On"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </section>
+          ) : null}
 
           {!showFirstLoadSkeleton && !actusModeDisplayAsset && viewMode === "deep" ? (
             <section style={{ display: "grid", gridTemplateColumns: "minmax(320px, 0.82fr) minmax(0, 1.18fr)", gap: 18 }}>
@@ -4831,7 +6296,7 @@ export default function App() {
             </section>
           ) : null}
 
-          {!showFirstLoadSkeleton && !actusModeDisplayAsset ? (
+          {!showFirstLoadSkeleton && !actusModeDisplayAsset && viewMode === "deep" ? (
             <section style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.8fr) minmax(320px, 1fr)", gap: 18 }}>
               <div style={{ background: "linear-gradient(145deg, rgba(10,17,31,0.98), rgba(7,12,22,0.96))", border: "1px solid rgba(132,151,186,0.16)", borderRadius: 26, padding: 18, boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)" }}>
                 <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>What Matters Now</div>
@@ -4931,17 +6396,16 @@ export default function App() {
                 <section style={{ background: "linear-gradient(145deg, rgba(10,17,31,0.98), rgba(7,12,22,0.96))", border: "1px solid rgba(132,151,186,0.16)", borderRadius: 26, padding: 18, boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)" }}>
                   <div style={{ fontSize: 11, color: "#7f8da8", letterSpacing: "0.12em", textTransform: "uppercase" }}>System Status</div>
                   <div style={{ marginTop: 12, fontSize: 14, color: "#d7e1f4", lineHeight: 1.6 }}>{snapshot.status.message}</div>
-                  <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
-                    {metricCard("Wait", `${filteredCounts.wait}`)}
-                    {metricCard("Execute", `${filteredCounts.execute}`)}
-                    {metricCard("Avoid", `${filteredCounts.avoid}`)}
-                  </div>
                 </section>
               </div>
             </section>
           ) : null}
 
-          {!showFirstLoadSkeleton && !actusModeDisplayAsset ? (
+          {!showFirstLoadSkeleton && !actusModeDisplayAsset && viewMode === "deep"
+            ? deepNyOpenFlowSection(filteredOpportunities, nyOpenFlowByAsset, nyOpenFlowHistoryByAsset)
+            : null}
+
+          {!showFirstLoadSkeleton && !actusModeDisplayAsset && viewMode === "focus" ? (
           <section style={{ background: "linear-gradient(145deg, rgba(4,6,10,0.995), rgba(1,2,5,0.995))", border: "1px solid rgba(98,116,148,0.16)", borderRadius: 26, padding: 18, boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03), 0 24px 60px rgba(0,0,0,0.34)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
               <div>
@@ -4954,15 +6418,15 @@ export default function App() {
             </div>
 
             <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 12 }}>
-              <div>{laneSummaryCard("Wait", `${grouped.wait.length}`, "Needs more confirmation", "wait")}</div>
-              <div>{laneSummaryCard("Execute", `${grouped.execute.length}`, "Highest conviction only", "execute")}</div>
-              <div>{laneSummaryCard("Avoid", `${grouped.avoid.length}`, "Weak or conflicted structure", "avoid")}</div>
+              <div>{laneSummaryCard("Wait", `${focusGrouped.wait.length}`, "Needs more confirmation", "wait")}</div>
+              <div>{laneSummaryCard("Execute", `${focusGrouped.execute.length}`, "Highest conviction only", "execute")}</div>
+              <div>{laneSummaryCard("Avoid", `${focusGrouped.avoid.length}`, "Weak or conflicted structure", "avoid")}</div>
             </div>
 
             <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 16, alignItems: "start" }}>
-              {laneCard("Wait", "wait", grouped.wait, "All waiting assets are listed from highest confidence down.", nowTick, openActusMode)}
-              {laneCard("Execute", "execute", grouped.execute, "Only the cleanest opportunities belong in the middle strike lane.", nowTick, openActusMode)}
-              {laneCard("Avoid", "avoid", grouped.avoid, "This lane collects late, conflicted, stretched, or weak conditions.", nowTick, openActusMode)}
+              {laneCard("Wait", "wait", focusGrouped.wait, "All waiting assets are listed from highest confidence down.", nowTick, openActusMode)}
+              {laneCard("Execute", "execute", focusGrouped.execute, "Only the cleanest opportunities belong in the middle strike lane.", nowTick, openActusMode)}
+              {laneCard("Avoid", "avoid", focusGrouped.avoid, "This lane collects late, conflicted, stretched, or weak conditions.", nowTick, openActusMode)}
             </div>
           </section>
           ) : null}
@@ -5087,6 +6551,7 @@ export default function App() {
                               symbol: entry.symbol,
                               timeframe: entry.timeframe,
                               snapshot: entry.snapshot,
+                              solView: isSolActusSymbol(entry.symbol) ? "binance-execution" : undefined,
                             })
                           }
                           style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 12, alignItems: "center", padding: "12px 14px", borderRadius: 16, background: "rgba(255,255,255,0.02)", border: `1px solid ${colors.border}`, textAlign: "left", cursor: "pointer" }}

@@ -40,6 +40,21 @@ export function hasExecutionInvalidation(item: ActusOpportunityOutput, position?
   return item.price <= position.stop;
 }
 
+function hasConfirmedReadyCriteria(item: ActusOpportunityOutput) {
+  return (
+    item.state === "building" &&
+    item.direction !== "neutral" &&
+    item.bias !== "neutral" &&
+    item.bias !== "mixed" &&
+    item.riskState === "clean" &&
+    item.triggerQuality !== "none" &&
+    item.triggerQuality !== "B" &&
+    item.confidenceScore >= 72 &&
+    item.freshnessState !== "aging" &&
+    item.freshnessState !== "stale"
+  );
+}
+
 export function deriveActusExecutionState(
   item: ActusOpportunityOutput,
   options: DeriveExecutionStateOptions = {},
@@ -62,7 +77,25 @@ export function deriveActusExecutionState(
       return "exit_soon";
     }
 
-    if (item.freshnessState === "aging" || item.riskState === "unstable") {
+    if (
+      item.action === "avoid" ||
+      item.direction === "neutral" ||
+      item.bias === "neutral" ||
+      item.confidenceScore < 40 ||
+      item.state === "balanced" ||
+      item.state === "waiting"
+    ) {
+      return "exit_soon";
+    }
+
+    if (
+      item.action !== "execute" ||
+      item.freshnessState === "aging" ||
+      item.riskState === "unstable" ||
+      item.confidenceScore < 60 ||
+      item.state === "watching" ||
+      item.state === "building"
+    ) {
       return "weakening";
     }
 
@@ -73,7 +106,7 @@ export function deriveActusExecutionState(
     return "too_late";
   }
 
-  if (item.state === "building") {
+  if (hasConfirmedReadyCriteria(item)) {
     return "ready";
   }
 
@@ -96,20 +129,16 @@ export function stabilizeExecutionTransition(
     return next;
   }
 
-  if (previous === "active" && (next === "ready" || next === "building")) {
-    return previous;
-  }
-
-  if (previous === "ready" && next === "building") {
-    return previous;
-  }
-
   if (previous === "exit_soon" && (next === "active" || next === "weakening")) {
     return previous;
   }
 
+  if (previous === "exit_soon" && next === "ready") {
+    return next;
+  }
+
   if (previous === "too_late" && (next === "ready" || next === "building")) {
-    return previous;
+    return next;
   }
 
   return next;

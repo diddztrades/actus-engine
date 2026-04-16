@@ -24,10 +24,13 @@ type Timeframe = TimeframeFilter;
 type Props = {
   symbol?: string;
   candles?: NormalizedFuturesCandle[] | null;
+  livePrice?: number | null;
   timeframe: Timeframe;
   height: number;
   entry?: number;
   invalidation?: number;
+  dayHigh?: number | null;
+  dayLow?: number | null;
   gammaOverlay?: GammaOverlay | null;
   deltaSignal?: DeltaSignal | null;
 };
@@ -74,16 +77,47 @@ function actusTraceKey(symbol: string | undefined, timeframe: Timeframe) {
   if (normalized === "NQ") return `NQ ${timeframe}`;
   if (normalized === "CL" || normalized === "OIL") return `OIL ${timeframe}`;
   if (normalized === "BTC" || normalized === "BTC/USD") return `BTC ${timeframe}`;
+  if (normalized === "SOL_CME" || normalized === "SOL-CME" || normalized === "SOL CME") return `SOL_CME ${timeframe}`;
   return null;
 }
 
-function overlayLineStyle(kind: "gammaFlip" | "callWall" | "putWall" | "anchor" | "spotReference") {
+function sourceIdentityLabels(symbol?: string) {
+  const normalized = symbol?.toUpperCase() ?? "";
+  if (normalized === "BTC" || normalized === "BTC/USD") {
+    return { live: "LIVE - MBT FUTURES", reference: "MBT REF" };
+  }
+  if (normalized === "ETH" || normalized === "ETH/USD") {
+    return { live: "LIVE - DERIBIT PERP", reference: "PERP REF" };
+  }
+  if (normalized === "SOL_CME" || normalized === "SOL-CME" || normalized === "SOL CME") {
+    return { live: "LIVE - SOL FUTURES", reference: "SOL FUT REF" };
+  }
+  if (normalized === "SOL" || normalized === "SOL/USD") {
+    return { live: "LIVE - BINANCE", reference: "BINANCE REF" };
+  }
+  if (normalized === "XAU" || normalized === "XAU/USD" || normalized === "GC") {
+    return { live: "LIVE - GC FUTURES", reference: "GC REF" };
+  }
+  if (normalized === "OIL" || normalized === "CL") {
+    return { live: "LIVE - CL FUTURES", reference: "CL REF" };
+  }
+  if (normalized === "NQ") {
+    return { live: "LIVE - NQ FUTURES", reference: "NQ REF" };
+  }
+  if (normalized === "EUR" || normalized === "EUR/USD" || normalized === "EURUSD" || normalized === "6E") {
+    return { live: "LIVE - 6E FUTURES", reference: "6E REF" };
+  }
+  return { live: "LIVE", reference: "REF" };
+}
+
+function overlayLineStyle(kind: "gammaFlip" | "callWall" | "putWall" | "anchor" | "spotReference", symbol?: string) {
   if (kind === "gammaFlip") {
     return {
       title: "G-FLIP",
       color: "rgba(245, 200, 106, 0.88)",
       lineStyle: LineStyle.Dashed,
       lineWidth: 1 as const,
+      axisLabelVisible: true,
     };
   }
 
@@ -92,7 +126,8 @@ function overlayLineStyle(kind: "gammaFlip" | "callWall" | "putWall" | "anchor" 
       title: "CALL WALL",
       color: "rgba(98, 196, 255, 0.82)",
       lineStyle: LineStyle.Dashed,
-      lineWidth: 2 as const,
+      lineWidth: 1 as const,
+      axisLabelVisible: true,
     };
   }
 
@@ -101,7 +136,8 @@ function overlayLineStyle(kind: "gammaFlip" | "callWall" | "putWall" | "anchor" 
       title: "PUT WALL",
       color: "rgba(255, 123, 159, 0.82)",
       lineStyle: LineStyle.Dashed,
-      lineWidth: 2 as const,
+      lineWidth: 1 as const,
+      axisLabelVisible: true,
     };
   }
 
@@ -111,14 +147,17 @@ function overlayLineStyle(kind: "gammaFlip" | "callWall" | "putWall" | "anchor" 
       color: "rgba(122, 217, 209, 0.64)",
       lineStyle: LineStyle.Dashed,
       lineWidth: 1 as const,
+      axisLabelVisible: true,
     };
   }
 
+  const labels = sourceIdentityLabels(symbol);
   return {
-    title: "SPOT",
+    title: labels.reference,
     color: "rgba(179, 193, 218, 0.38)",
     lineStyle: LineStyle.Dotted,
     lineWidth: 1 as const,
+    axisLabelVisible: true,
   };
 }
 
@@ -131,6 +170,175 @@ function symbolPriceFormat(symbol: string | undefined) {
     return { precision: 2, minMove: 0.01 };
   }
   return { precision: 2, minMove: 0.01 };
+}
+
+function priceLineEpsilon(symbol: string | undefined) {
+  const format = symbolPriceFormat(symbol);
+  return Math.max(format.minMove * 4, 0.0001);
+}
+
+function hasFinitePrice(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isReferenceRedundant(referencePrice: number | null | undefined, livePrice: number | null | undefined, symbol?: string) {
+  if (typeof referencePrice !== "number" || !Number.isFinite(referencePrice)) {
+    return false;
+  }
+  if (typeof livePrice !== "number" || !Number.isFinite(livePrice)) {
+    return false;
+  }
+  return Math.abs(referencePrice - livePrice) <= priceLineEpsilon(symbol);
+}
+
+type OverlayKind = "gammaFlip" | "callWall" | "putWall" | "anchor" | "spotReference";
+type SecondaryReferenceKind = "dayHigh" | "dayLow";
+
+function overlayPriority(kind: OverlayKind) {
+  if (kind === "callWall") return 0;
+  if (kind === "putWall") return 1;
+  if (kind === "gammaFlip") return 2;
+  if (kind === "anchor") return 3;
+  return 4;
+}
+
+function secondaryReferenceStyle(kind: SecondaryReferenceKind) {
+  return {
+    title: kind === "dayHigh" ? "HOD" : "LOD",
+    color: "rgba(176, 189, 214, 0.34)",
+    lineStyle: LineStyle.Dashed,
+    lineWidth: 1 as const,
+    axisLabelVisible: true,
+  };
+}
+
+function dedupeOverlayLabels(args: {
+  symbol?: string;
+  livePrice: number | null;
+  overlay: {
+    gammaFlip: number | null | undefined;
+    callWall: number | null | undefined;
+    putWall: number | null | undefined;
+    anchor: number | null | undefined;
+    spotReference: number | null | undefined;
+  };
+}) {
+  const { symbol, livePrice, overlay } = args;
+  const epsilon = priceLineEpsilon(symbol);
+  const labels = sourceIdentityLabels(symbol);
+  const entries = ([
+    { kind: "callWall", price: overlay.callWall, title: "CALL WALL" },
+    { kind: "putWall", price: overlay.putWall, title: "PUT WALL" },
+    { kind: "gammaFlip", price: overlay.gammaFlip, title: "G-FLIP" },
+    { kind: "anchor", price: overlay.anchor, title: "ANCHOR" },
+    { kind: "spotReference", price: overlay.spotReference, title: labels.reference },
+  ] as const)
+    .filter((entry) => typeof entry.price === "number" && Number.isFinite(entry.price))
+    .sort((a, b) => overlayPriority(a.kind) - overlayPriority(b.kind));
+
+  const clusters: Array<{
+    price: number;
+    entries: Array<(typeof entries)[number]>;
+  }> = [];
+
+  entries.forEach((entry) => {
+    const cluster = clusters.find((candidate) => Math.abs(candidate.price - Number(entry.price)) <= epsilon);
+    if (cluster) {
+      cluster.entries.push(entry);
+      return;
+    }
+    clusters.push({
+      price: Number(entry.price),
+      entries: [entry],
+    });
+  });
+
+  const result: Record<OverlayKind, { axisLabelVisible: boolean; title: string }> = {
+    gammaFlip: { axisLabelVisible: false, title: "G-FLIP" },
+    callWall: { axisLabelVisible: false, title: "CALL WALL" },
+    putWall: { axisLabelVisible: false, title: "PUT WALL" },
+    anchor: { axisLabelVisible: false, title: "ANCHOR" },
+    spotReference: { axisLabelVisible: false, title: labels.reference },
+  };
+
+  clusters.forEach((cluster) => {
+    const overlapsLive =
+      typeof livePrice === "number" &&
+      Number.isFinite(livePrice) &&
+      Math.abs(cluster.price - livePrice) <= epsilon;
+    const visibleEntry = cluster.entries[0];
+    const mergedTitle = cluster.entries.map((entry) => entry.title).filter((title, index, items) => items.indexOf(title) === index).join(" / ");
+
+    cluster.entries.forEach((entry) => {
+      result[entry.kind] = {
+        axisLabelVisible: !overlapsLive && entry.kind === visibleEntry.kind,
+        title: entry.kind === visibleEntry.kind ? mergedTitle : entry.title,
+      };
+    });
+  });
+
+  if (
+    typeof overlay.spotReference === "number" &&
+    Number.isFinite(overlay.spotReference) &&
+    isReferenceRedundant(overlay.spotReference, livePrice, symbol)
+  ) {
+    result.spotReference = {
+      axisLabelVisible: false,
+      title: labels.reference,
+    };
+  }
+
+  return result;
+}
+
+function secondaryReferenceLabelPlan(args: {
+  symbol?: string;
+  livePrice: number | null;
+  gammaOverlay: GammaOverlay | null;
+  deltaPrice: number | null;
+  dayHigh: number | null | undefined;
+  dayLow: number | null | undefined;
+}) {
+  const epsilon = priceLineEpsilon(args.symbol);
+  const strongerPrices = [
+    args.livePrice,
+    args.gammaOverlay?.callWall,
+    args.gammaOverlay?.putWall,
+    args.gammaOverlay?.gammaFlip,
+    args.gammaOverlay?.anchor,
+    args.gammaOverlay?.spotReference,
+    args.deltaPrice,
+  ];
+
+  const entries = ([
+    { kind: "dayHigh", price: args.dayHigh, title: "HOD" },
+    { kind: "dayLow", price: args.dayLow, title: "LOD" },
+  ] as const).filter((entry) => typeof entry.price === "number" && Number.isFinite(entry.price));
+
+  const result: Record<SecondaryReferenceKind, { axisLabelVisible: boolean; title: string }> = {
+    dayHigh: { axisLabelVisible: false, title: "HOD" },
+    dayLow: { axisLabelVisible: false, title: "LOD" },
+  };
+
+  const visibleSecondaryPrices: number[] = [];
+  entries.forEach((entry) => {
+    const nextPrice = Number(entry.price);
+    const overlapsStronger = strongerPrices.some(
+      (price) => hasFinitePrice(price) && Math.abs(Number(price) - nextPrice) <= epsilon,
+    );
+    const overlapsVisibleSecondary = visibleSecondaryPrices.some((price) => Math.abs(price - nextPrice) <= epsilon);
+
+    result[entry.kind] = {
+      axisLabelVisible: !overlapsStronger && !overlapsVisibleSecondary,
+      title: entry.title,
+    };
+
+    if (!overlapsStronger && !overlapsVisibleSecondary) {
+      visibleSecondaryPrices.push(nextPrice);
+    }
+  });
+
+  return result;
 }
 
 function deltaVisualTone(signal: DeltaSignal | null) {
@@ -171,11 +379,168 @@ function deltaVisualTone(signal: DeltaSignal | null) {
   };
 }
 
+function deltaStructurePlan(signal: DeltaSignal | null) {
+  const referencePrice = hasFinitePrice(signal?.deltaReferencePrice) ? Number(signal?.deltaReferencePrice) : null;
+  if (!signal || referencePrice === null) {
+    return {
+      visible: false,
+      price: null,
+      title: "DELTA",
+      color: "#67b7ff",
+      lineStyle: LineStyle.Dotted,
+      lineWidth: 1 as const,
+      axisLabelVisible: false,
+    };
+  }
+
+  if (signal.deltaAvailability === "DIRECTIONAL") {
+    const bullish = signal.bias === "LONG" || signal.condition === "ACCUMULATION";
+    return {
+      visible: true,
+      price: referencePrice,
+      title: bullish ? "DELTA LONG" : signal.bias === "SHORT" || signal.condition === "DISTRIBUTION" ? "DELTA SHORT" : "DELTA",
+      color: bullish ? "rgba(69,255,181,0.56)" : "rgba(255,142,168,0.56)",
+      lineStyle: LineStyle.Dashed,
+      lineWidth: 1 as const,
+      axisLabelVisible: true,
+    };
+  }
+
+  if (signal.deltaAvailability === "SOURCE_ONLY") {
+    return {
+      visible: true,
+      price: referencePrice,
+      title: "DELTA FLOW",
+      color: "rgba(103,183,255,0.42)",
+      lineStyle: LineStyle.Dotted,
+      lineWidth: 1 as const,
+      axisLabelVisible: true,
+    };
+  }
+
+  return {
+    visible: false,
+    price: null,
+    title: "DELTA",
+    color: "#67b7ff",
+    lineStyle: LineStyle.Dotted,
+    lineWidth: 1 as const,
+    axisLabelVisible: false,
+  };
+}
+
+function deltaAxisLabelVisible(args: {
+  symbol?: string;
+  livePrice: number | null;
+  deltaPrice: number | null;
+  gammaOverlay: GammaOverlay | null;
+}) {
+  const { symbol, livePrice, deltaPrice, gammaOverlay } = args;
+  if (!hasFinitePrice(deltaPrice)) {
+    return false;
+  }
+
+  const epsilon = priceLineEpsilon(symbol);
+  if (hasFinitePrice(livePrice) && Math.abs(Number(deltaPrice) - Number(livePrice)) <= epsilon) {
+    return false;
+  }
+
+  const structuralPrices = [
+    gammaOverlay?.callWall,
+    gammaOverlay?.putWall,
+    gammaOverlay?.gammaFlip,
+    gammaOverlay?.anchor,
+  ];
+
+  return !structuralPrices.some((price) => hasFinitePrice(price) && Math.abs(Number(deltaPrice) - Number(price)) <= epsilon);
+}
+
+function hasFiniteOverlayValue(value: number | null | undefined) {
+  return hasFinitePrice(value);
+}
+
+function gammaVisualTone(overlay: GammaOverlay | null) {
+  const sourceAvailable = Boolean(overlay?.source);
+  const levelsAvailable =
+    hasFiniteOverlayValue(overlay?.callWall ?? null) ||
+    hasFiniteOverlayValue(overlay?.putWall ?? null) ||
+    hasFiniteOverlayValue(overlay?.anchor ?? null) ||
+    hasFiniteOverlayValue(overlay?.gammaFlip ?? null);
+  const directionalAvailable = hasFiniteOverlayValue(overlay?.gammaFlip ?? null);
+
+  if (sourceAvailable && levelsAvailable && directionalAvailable) {
+    return {
+      label: "Gamma Directional",
+      color: "#d7ffea",
+      accent: "#45ffb5",
+      background: "rgba(69,255,181,0.1)",
+      border: "rgba(69,255,181,0.22)",
+    };
+  }
+  if (sourceAvailable && levelsAvailable) {
+    return {
+      label: "Gamma Levels Active",
+      color: "#d8e7ff",
+      accent: "#67b7ff",
+      background: "rgba(103,183,255,0.1)",
+      border: "rgba(103,183,255,0.2)",
+    };
+  }
+  if (sourceAvailable) {
+    return {
+      label: "Gamma Source Only",
+      color: "#d8e7ff",
+      accent: "#8fbfff",
+      background: "rgba(103,183,255,0.08)",
+      border: "rgba(103,183,255,0.16)",
+    };
+  }
+  return {
+    label: "Gamma Unavailable",
+    color: "#d3c1cb",
+    accent: "#ff9db3",
+    background: "rgba(255,111,145,0.07)",
+    border: "rgba(255,111,145,0.14)",
+  };
+}
+
+function gammaVisualSummary(overlay: GammaOverlay | null) {
+  if (!overlay?.source) {
+    return {
+      title: "Gamma pending",
+      detail: "No source yet",
+    };
+  }
+
+  if (hasFiniteOverlayValue(overlay?.gammaFlip ?? null)) {
+    return {
+      title: "Walls + flip",
+      detail: "Resolved structure",
+    };
+  }
+
+  if (
+    hasFiniteOverlayValue(overlay?.callWall ?? null) ||
+    hasFiniteOverlayValue(overlay?.putWall ?? null) ||
+    hasFiniteOverlayValue(overlay?.anchor ?? null)
+  ) {
+    return {
+      title: "Levels visible",
+      detail: "Exposure map only",
+    };
+  }
+
+  return {
+    title: "Source active",
+    detail: "Structure still sparse",
+  };
+}
+
 function deltaVisualSummary(signal: DeltaSignal | null) {
   if (!signal) {
     return {
-      title: "Delta waiting",
-      detail: "Awaiting source",
+      title: "Delta pending",
+      detail: "Awaiting live flow",
     };
   }
 
@@ -190,9 +555,10 @@ function deltaVisualSummary(signal: DeltaSignal | null) {
   }
 
   if (signal.deltaAvailability === "SOURCE_ONLY") {
+    const strength = signal.strength && signal.strength > 0 ? `${Math.round(signal.strength * 100)}% flow` : "Flow present";
     return {
       title: "Flow present",
-      detail: "Non-directional source",
+      detail: strength,
     };
   }
 
@@ -204,22 +570,38 @@ function deltaVisualSummary(signal: DeltaSignal | null) {
   }
 
   return {
-    title: "No delta read",
+    title: "Flow unavailable",
     detail: "No usable source",
   };
 }
 
-export function ActusChart({ symbol, candles, timeframe, height, entry, invalidation, gammaOverlay, deltaSignal }: Props) {
+export function ActusChart({
+  symbol,
+  candles,
+  livePrice,
+  timeframe,
+  height,
+  entry,
+  invalidation,
+  dayHigh,
+  dayLow,
+  gammaOverlay,
+  deltaSignal,
+}: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick", Time> | null>(null);
+  const livePriceLineRef = useRef<IPriceLine | null>(null);
   const entryPriceLineRef = useRef<IPriceLine | null>(null);
   const stopPriceLineRef = useRef<IPriceLine | null>(null);
+  const deltaPriceLineRef = useRef<IPriceLine | null>(null);
   const gammaFlipLineRef = useRef<IPriceLine | null>(null);
   const callWallLineRef = useRef<IPriceLine | null>(null);
   const putWallLineRef = useRef<IPriceLine | null>(null);
   const anchorLineRef = useRef<IPriceLine | null>(null);
   const spotReferenceLineRef = useRef<IPriceLine | null>(null);
+  const dayHighLineRef = useRef<IPriceLine | null>(null);
+  const dayLowLineRef = useRef<IPriceLine | null>(null);
   const previousDataRef = useRef<ReturnType<typeof buildCandlestickData> | null>(null);
   const latestCandleDataRef = useRef<ReturnType<typeof buildCandlestickData> | null>(null);
   const visibleRangeFrameRef = useRef<number | null>(null);
@@ -227,8 +609,12 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
   const userAtLiveEdgeRef = useRef(true);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const mountFrameRef = useRef<number | null>(null);
+  const livePriceValueRef = useRef<number | null>(null);
+  const livePriceSymbolRef = useRef<string | undefined>(undefined);
   const entryPriceValueRef = useRef<number | null>(null);
   const stopPriceValueRef = useRef<number | null>(null);
+  const deltaPriceValueRef = useRef<number | null>(null);
+  const deltaPriceTitleRef = useRef("DELTA");
   const overlayValuesRef = useRef<{
     gammaFlip: number | null;
     callWall: number | null;
@@ -246,6 +632,24 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
     source: null,
     updatedAt: null,
   });
+  const overlayTitleRef = useRef<Record<OverlayKind, string>>({
+    gammaFlip: "G-FLIP",
+    callWall: "CALL WALL",
+    putWall: "PUT WALL",
+    anchor: "ANCHOR",
+    spotReference: "REF",
+  });
+  const secondaryReferenceValuesRef = useRef<{
+    dayHigh: number | null;
+    dayLow: number | null;
+  }>({
+    dayHigh: null,
+    dayLow: null,
+  });
+  const secondaryReferenceTitleRef = useRef<Record<SecondaryReferenceKind, string>>({
+    dayHigh: "HOD",
+    dayLow: "LOD",
+  });
 
   const candleData = useMemo(() => {
     if (!candles?.length) return null;
@@ -254,11 +658,17 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
     [candles],
   );
   const lastValue = candleData?.[candleData.length - 1]?.close ?? null;
+  const effectiveLivePrice = typeof livePrice === "number" && Number.isFinite(livePrice) ? livePrice : lastValue;
   const traceKey = useMemo(() => actusTraceKey(symbol, timeframe), [symbol, timeframe]);
   const [atLiveEdge, setAtLiveEdge] = useState(true);
+  const [chartReadyTick, setChartReadyTick] = useState(0);
   const priceFormat = useMemo(() => symbolPriceFormat(symbol), [symbol]);
+  const sourceLabels = useMemo(() => sourceIdentityLabels(symbol), [symbol]);
+  const gammaTone = useMemo(() => gammaVisualTone(gammaOverlay ?? null), [gammaOverlay]);
+  const gammaSummary = useMemo(() => gammaVisualSummary(gammaOverlay ?? null), [gammaOverlay]);
   const deltaTone = useMemo(() => deltaVisualTone(deltaSignal ?? null), [deltaSignal]);
   const deltaSummary = useMemo(() => deltaVisualSummary(deltaSignal ?? null), [deltaSignal]);
+  const deltaPlan = useMemo(() => deltaStructurePlan(deltaSignal ?? null), [deltaSignal]);
 
   const tickMarkFormatter = useCallback((time: Time, _tickMarkType: TickMarkType, _locale: string) => {
     return formatActusTickMark(time, _tickMarkType, _locale, timeframe);
@@ -269,16 +679,16 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
   }, [candleData]);
 
   const currentBias =
-    lastValue !== null && typeof entry === "number" && typeof invalidation === "number"
+    effectiveLivePrice !== null && typeof entry === "number" && typeof invalidation === "number"
       ? entry > invalidation
-        ? lastValue >= entry
+        ? effectiveLivePrice >= entry
           ? "positive"
-          : lastValue <= invalidation
+          : effectiveLivePrice <= invalidation
             ? "negative"
             : "neutral"
-        : lastValue <= entry
+        : effectiveLivePrice <= entry
           ? "positive"
-          : lastValue >= invalidation
+          : effectiveLivePrice >= invalidation
             ? "negative"
             : "neutral"
       : "neutral";
@@ -431,15 +841,15 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
         wickDownColor: "rgba(255,95,125,0.88)",
         borderVisible: true,
         wickVisible: true,
-        lastValueVisible: true,
-        priceLineVisible: true,
-        priceLineColor: liveColor,
+        lastValueVisible: false,
+        priceLineVisible: false,
         priceFormat,
       });
 
       chartRef.current = chart;
       candleSeriesRef.current = candleSeries;
       chart.resize(width, measuredHeight);
+      setChartReadyTick((current) => current + 1);
 
       chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
         if (!latestCandleDataRef.current?.length || suppressRangeTrackingRef.current) return;
@@ -478,13 +888,17 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
       chart?.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
+      livePriceLineRef.current = null;
       entryPriceLineRef.current = null;
       stopPriceLineRef.current = null;
+      deltaPriceLineRef.current = null;
       gammaFlipLineRef.current = null;
       callWallLineRef.current = null;
       putWallLineRef.current = null;
       anchorLineRef.current = null;
       spotReferenceLineRef.current = null;
+      dayHighLineRef.current = null;
+      dayLowLineRef.current = null;
       previousDataRef.current = null;
       if (visibleRangeFrameRef.current !== null) {
         window.cancelAnimationFrame(visibleRangeFrameRef.current);
@@ -496,10 +910,107 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
   useEffect(() => {
     if (!candleSeriesRef.current) return;
 
-    candleSeriesRef.current.applyOptions({
-      priceLineColor: liveColor,
-    });
-  }, [liveColor]);
+    const nextDeltaPrice = deltaPlan.visible ? deltaPlan.price : null;
+    const nextAxisLabelVisible =
+      deltaPlan.axisLabelVisible &&
+      deltaAxisLabelVisible({
+        symbol,
+        livePrice: livePriceValueRef.current,
+        deltaPrice: nextDeltaPrice,
+        gammaOverlay: gammaOverlay ?? null,
+      });
+
+    if (deltaPriceValueRef.current === nextDeltaPrice && deltaPriceTitleRef.current === deltaPlan.title) {
+      if (deltaPriceLineRef.current && "applyOptions" in deltaPriceLineRef.current) {
+        deltaPriceLineRef.current.applyOptions({
+          axisLabelVisible: nextAxisLabelVisible,
+        });
+      }
+      return;
+    }
+
+    if (nextDeltaPrice !== null) {
+      if (deltaPriceLineRef.current && "applyOptions" in deltaPriceLineRef.current) {
+        deltaPriceLineRef.current.applyOptions({
+          price: nextDeltaPrice,
+          color: deltaPlan.color,
+          lineWidth: deltaPlan.lineWidth,
+          lineStyle: deltaPlan.lineStyle,
+          axisLabelVisible: nextAxisLabelVisible,
+          title: deltaPlan.title,
+        });
+      } else {
+        if (deltaPriceLineRef.current) {
+          candleSeriesRef.current.removePriceLine(deltaPriceLineRef.current);
+        }
+        deltaPriceLineRef.current = candleSeriesRef.current.createPriceLine({
+          price: nextDeltaPrice,
+          color: deltaPlan.color,
+          lineWidth: deltaPlan.lineWidth,
+          lineStyle: deltaPlan.lineStyle,
+          axisLabelVisible: nextAxisLabelVisible,
+          title: deltaPlan.title,
+        });
+      }
+    } else if (deltaPriceLineRef.current) {
+      candleSeriesRef.current.removePriceLine(deltaPriceLineRef.current);
+      deltaPriceLineRef.current = null;
+    }
+
+    deltaPriceValueRef.current = nextDeltaPrice;
+    deltaPriceTitleRef.current = deltaPlan.title;
+  }, [chartReadyTick, deltaPlan, effectiveLivePrice, gammaOverlay, symbol]);
+
+  useEffect(() => {
+    if (!candleSeriesRef.current) return;
+
+    const symbolChanged = livePriceSymbolRef.current !== symbol;
+    if (symbolChanged) {
+      livePriceSymbolRef.current = symbol;
+      livePriceValueRef.current = null;
+    }
+
+    const nextLivePrice =
+      typeof effectiveLivePrice === "number" && Number.isFinite(effectiveLivePrice)
+        ? effectiveLivePrice
+        : symbolChanged
+          ? null
+          : livePriceValueRef.current;
+
+    if (livePriceValueRef.current === nextLivePrice) {
+      return;
+    }
+
+    if (nextLivePrice !== null) {
+      if (livePriceLineRef.current && "applyOptions" in livePriceLineRef.current) {
+        livePriceLineRef.current.applyOptions({
+          price: nextLivePrice,
+          color: liveColor,
+          lineWidth: 2,
+          lineStyle: LineStyle.Solid,
+          axisLabelVisible: true,
+          title: sourceLabels.live,
+        });
+      } else {
+        if (livePriceLineRef.current) {
+          candleSeriesRef.current.removePriceLine(livePriceLineRef.current);
+        }
+        livePriceLineRef.current = candleSeriesRef.current.createPriceLine({
+          price: nextLivePrice,
+          color: liveColor,
+          lineWidth: 2,
+          lineStyle: LineStyle.Solid,
+          axisLabelVisible: true,
+          title: sourceLabels.live,
+        });
+      }
+    } else if (livePriceLineRef.current) {
+      candleSeriesRef.current.removePriceLine(livePriceLineRef.current);
+      livePriceLineRef.current = null;
+    }
+
+    livePriceValueRef.current = nextLivePrice;
+  }, [chartReadyTick, effectiveLivePrice, liveColor, sourceLabels.live]);
 
   useEffect(() => {
     if (!candleSeriesRef.current) return;
@@ -551,41 +1062,72 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
       }
     }
     previousDataRef.current = candleData;
-  }, [applyVisibleRange, candleData, candles?.length, traceKey]);
+  }, [applyVisibleRange, candleData, candles?.length, chartReadyTick, traceKey]);
 
   useEffect(() => {
     const series = candleSeriesRef.current;
     if (!series) return;
+    const labelPlan = dedupeOverlayLabels({
+      symbol,
+      livePrice: livePriceValueRef.current,
+      overlay: {
+        gammaFlip: gammaOverlay?.gammaFlip,
+        callWall: gammaOverlay?.callWall,
+        putWall: gammaOverlay?.putWall,
+        anchor: gammaOverlay?.anchor,
+        spotReference: gammaOverlay?.spotReference,
+      },
+    });
 
     const syncPriceLine = (
       ref: { current: IPriceLine | null },
       price: number | null | undefined,
-      kind: "gammaFlip" | "callWall" | "putWall" | "anchor" | "spotReference",
+      kind: OverlayKind,
       previousPrice: number | null,
     ) => {
-      if (previousPrice === (typeof price === "number" && Number.isFinite(price) ? price : null)) {
+      const nextPrice = typeof price === "number" && Number.isFinite(price) ? price : null;
+      const style = overlayLineStyle(kind, symbol);
+      const plan = labelPlan[kind];
+      const nextTitle = plan.title;
+      const previousTitle = overlayTitleRef.current[kind];
+
+      if (previousPrice === nextPrice && previousTitle === nextTitle) {
         return previousPrice;
       }
 
-      if (ref.current) {
-        series.removePriceLine(ref.current);
-        ref.current = null;
-      }
-
-      if (typeof price !== "number" || !Number.isFinite(price)) {
+      if (nextPrice === null) {
+        if (ref.current) {
+          series.removePriceLine(ref.current);
+          ref.current = null;
+        }
+        overlayTitleRef.current[kind] = nextTitle;
         return null;
       }
 
-      const style = overlayLineStyle(kind);
-      ref.current = series.createPriceLine({
-        price,
-        color: style.color,
-        lineWidth: style.lineWidth,
-        lineStyle: style.lineStyle,
-        axisLabelVisible: true,
-        title: style.title,
-      });
-      return price;
+      if (ref.current && "applyOptions" in ref.current) {
+        ref.current.applyOptions({
+          price: nextPrice,
+          color: style.color,
+          lineWidth: style.lineWidth,
+          lineStyle: style.lineStyle,
+          axisLabelVisible: plan.axisLabelVisible && style.axisLabelVisible,
+          title: nextTitle,
+        });
+      } else {
+        if (ref.current) {
+          series.removePriceLine(ref.current);
+        }
+        ref.current = series.createPriceLine({
+          price: nextPrice,
+          color: style.color,
+          lineWidth: style.lineWidth,
+          lineStyle: style.lineStyle,
+          axisLabelVisible: plan.axisLabelVisible && style.axisLabelVisible,
+          title: nextTitle,
+        });
+      }
+      overlayTitleRef.current[kind] = nextTitle;
+      return nextPrice;
     };
 
     const previousOverlay = overlayValuesRef.current;
@@ -619,7 +1161,97 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
         updatedAt: overlayValuesRef.current.updatedAt,
       });
     }
-  }, [gammaOverlay, traceKey]);
+  }, [chartReadyTick, effectiveLivePrice, gammaOverlay, symbol, traceKey]);
+
+  useEffect(() => {
+    const series = candleSeriesRef.current;
+    if (!series) return;
+
+    const nextDeltaPrice = deltaPlan.visible ? deltaPlan.price : null;
+    const labelPlan = secondaryReferenceLabelPlan({
+      symbol,
+      livePrice: effectiveLivePrice,
+      gammaOverlay: gammaOverlay ?? null,
+      deltaPrice: nextDeltaPrice,
+      dayHigh,
+      dayLow,
+    });
+
+    const syncSecondaryReference = (
+      ref: { current: IPriceLine | null },
+      price: number | null | undefined,
+      kind: SecondaryReferenceKind,
+      previousPrice: number | null,
+    ) => {
+      const nextPrice = typeof price === "number" && Number.isFinite(price) ? price : null;
+      const style = secondaryReferenceStyle(kind);
+      const plan = labelPlan[kind];
+      const nextTitle = plan.title;
+      const previousTitle = secondaryReferenceTitleRef.current[kind];
+
+      if (previousPrice === nextPrice && previousTitle === nextTitle) {
+        if (ref.current && "applyOptions" in ref.current) {
+          ref.current.applyOptions({
+            axisLabelVisible: plan.axisLabelVisible && style.axisLabelVisible,
+            title: nextTitle,
+          });
+        }
+        return previousPrice;
+      }
+
+      if (nextPrice === null) {
+        if (ref.current) {
+          series.removePriceLine(ref.current);
+          ref.current = null;
+        }
+        secondaryReferenceTitleRef.current[kind] = nextTitle;
+        return null;
+      }
+
+      if (ref.current && "applyOptions" in ref.current) {
+        ref.current.applyOptions({
+          price: nextPrice,
+          color: style.color,
+          lineWidth: style.lineWidth,
+          lineStyle: style.lineStyle,
+          axisLabelVisible: plan.axisLabelVisible && style.axisLabelVisible,
+          title: nextTitle,
+        });
+      } else {
+        if (ref.current) {
+          series.removePriceLine(ref.current);
+        }
+        ref.current = series.createPriceLine({
+          price: nextPrice,
+          color: style.color,
+          lineWidth: style.lineWidth,
+          lineStyle: style.lineStyle,
+          axisLabelVisible: plan.axisLabelVisible && style.axisLabelVisible,
+          title: nextTitle,
+        });
+      }
+      secondaryReferenceTitleRef.current[kind] = nextTitle;
+      return nextPrice;
+    };
+
+    const previousSecondary = secondaryReferenceValuesRef.current;
+    const nextDayHigh = syncSecondaryReference(dayHighLineRef, dayHigh, "dayHigh", previousSecondary.dayHigh);
+    const nextDayLow = syncSecondaryReference(dayLowLineRef, dayLow, "dayLow", previousSecondary.dayLow);
+
+    secondaryReferenceValuesRef.current = {
+      dayHigh: nextDayHigh,
+      dayLow: nextDayLow,
+    };
+
+    if (traceKey) {
+      console.info(`[ACTUS][${traceKey}][session-structure]`, {
+        dayHigh: secondaryReferenceValuesRef.current.dayHigh,
+        dayLow: secondaryReferenceValuesRef.current.dayLow,
+        dayHighLabelVisible: labelPlan.dayHigh.axisLabelVisible,
+        dayLowLabelVisible: labelPlan.dayLow.axisLabelVisible,
+      });
+    }
+  }, [chartReadyTick, dayHigh, dayLow, deltaPlan, effectiveLivePrice, gammaOverlay, symbol, traceKey]);
 
   useEffect(() => {
     if (!candleSeriesRef.current) return;
@@ -649,7 +1281,7 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
       }
       entryPriceValueRef.current = null;
     }
-  }, [entry]);
+  }, [chartReadyTick, entry]);
 
   useEffect(() => {
     if (!candleSeriesRef.current) return;
@@ -679,7 +1311,7 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
       }
       stopPriceValueRef.current = null;
     }
-  }, [invalidation]);
+  }, [chartReadyTick, invalidation]);
 
   return (
     <div
@@ -735,45 +1367,94 @@ export function ActusChart({ symbol, candles, timeframe, height, entry, invalida
           bottom: 10,
           zIndex: 2,
           display: "grid",
-          gap: 3,
-          minWidth: 0,
+          gap: 6,
+          width: "min(280px, calc(100% - 20px))",
           maxWidth: "46%",
-          padding: "7px 9px",
-          borderRadius: 12,
-          background: deltaTone.background,
-          border: `1px solid ${deltaTone.border}`,
-          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.025)",
           pointerEvents: "none",
-          backdropFilter: "blur(4px)",
-          opacity: 0.94,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-          <span
-            style={{
-              width: 6,
-              height: 6,
-              borderRadius: 999,
-              background: deltaTone.accent,
-              boxShadow: `0 0 8px ${deltaTone.accent}`,
-              flex: "0 0 auto",
-            }}
-          />
-          <span
-            style={{
-              fontSize: 10,
-              color: deltaTone.color,
-              letterSpacing: "0.1em",
-              textTransform: "uppercase",
-              fontWeight: 800,
-              whiteSpace: "nowrap",
-            }}
-          >
-            {deltaTone.label}
-          </span>
+        <div
+          style={{
+            display: "grid",
+            gap: 3,
+            minWidth: 0,
+            padding: "7px 9px",
+            borderRadius: 12,
+            background: gammaTone.background,
+            border: `1px solid ${gammaTone.border}`,
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.025)",
+            backdropFilter: "blur(4px)",
+            opacity: 0.94,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: 999,
+                background: gammaTone.accent,
+                boxShadow: `0 0 8px ${gammaTone.accent}`,
+                flex: "0 0 auto",
+              }}
+            />
+            <span
+              style={{
+                fontSize: 10,
+                color: gammaTone.color,
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                fontWeight: 800,
+                whiteSpace: "nowrap",
+              }}
+            >
+              {gammaTone.label}
+            </span>
+          </div>
+          <div style={{ fontSize: 11, color: "#eef4ff", fontWeight: 700, lineHeight: 1.2 }}>{gammaSummary.title}</div>
+          <div style={{ fontSize: 10, color: "#b8c6de", lineHeight: 1.2 }}>{gammaSummary.detail}</div>
         </div>
-        <div style={{ fontSize: 11, color: "#eef4ff", fontWeight: 700, lineHeight: 1.2 }}>{deltaSummary.title}</div>
-        <div style={{ fontSize: 10, color: "#b8c6de", lineHeight: 1.2 }}>{deltaSummary.detail}</div>
+        <div
+          style={{
+            display: "grid",
+            gap: 3,
+            minWidth: 0,
+            padding: "7px 9px",
+            borderRadius: 12,
+            background: deltaTone.background,
+            border: `1px solid ${deltaTone.border}`,
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.025)",
+            backdropFilter: "blur(4px)",
+            opacity: 0.94,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: 999,
+                background: deltaTone.accent,
+                boxShadow: `0 0 8px ${deltaTone.accent}`,
+                flex: "0 0 auto",
+              }}
+            />
+            <span
+              style={{
+                fontSize: 10,
+                color: deltaTone.color,
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                fontWeight: 800,
+                whiteSpace: "nowrap",
+              }}
+            >
+              {deltaTone.label}
+            </span>
+          </div>
+          <div style={{ fontSize: 11, color: "#eef4ff", fontWeight: 700, lineHeight: 1.2 }}>{deltaSummary.title}</div>
+          <div style={{ fontSize: 10, color: "#b8c6de", lineHeight: 1.2 }}>{deltaSummary.detail}</div>
+        </div>
       </div>
       <div ref={containerRef} style={{ width: "100%", minWidth: 0, height, minHeight: height, display: "block" }} />
     </div>

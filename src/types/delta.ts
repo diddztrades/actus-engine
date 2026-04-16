@@ -9,6 +9,7 @@ export type DeltaSignal = {
   deltaSupportedAsset: boolean;
   deltaSourceAvailable: boolean;
   deltaDirectionalAvailable: boolean;
+  deltaReferencePrice?: number | null;
   bias?: "LONG" | "SHORT" | "NEUTRAL";
   strength?: number;
   condition?: "ACCUMULATION" | "DISTRIBUTION" | "ABSORPTION" | "NEUTRAL";

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { buildLiveBoardInputs, clearLiveBoardInputCache } from "./buildLiveBoardInputs";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { buildLiveBoardInputs, buildLiveBoardSeedInputs, clearLiveBoardInputCache } from "./buildLiveBoardInputs";
 import { normalizeHybridContext } from "../../data/actus/normalizeHybridContext";
 import type { ActusNormalizedMarketInput, ActusPlatformSnapshot, ActusSystemStatus, ActusTimeframe } from "../../domain/market/types";
 import {
@@ -68,14 +68,17 @@ export function useActusPlatform(timeframe: ActusTimeframe) {
   const [systemSnapshot, setSystemSnapshot] = useState<{ connection: "online" | "offline"; dataSource: "supabase" | "local" } | null>(cachedSystemSnapshot);
   const [marketInputs, setMarketInputs] = useState<ActusNormalizedMarketInput[]>(marketInputsCache[timeframe] ?? []);
   const hasCachedInputs = (marketInputsCache[timeframe]?.length ?? 0) > 0;
+  const refreshRequestRef = useRef(0);
 
   const refresh = useCallback(async (options?: { force?: boolean }) => {
+    const requestId = refreshRequestRef.current + 1;
+    refreshRequestRef.current = requestId;
     const cachedInputs = marketInputsCache[timeframe];
+    const visibleInputs = marketInputs.length ? marketInputs : cachedInputs ?? [];
     if (options?.force) {
-      delete marketInputsCache[timeframe];
       clearLiveBoardInputCache();
     }
-    setLoading(options?.force ? true : !cachedInputs?.length);
+    setLoading(!visibleInputs.length);
 
     const [_, macroResult, systemResult] = await Promise.all([
       primeHybridDataFeed(timeframe, { force: options?.force }),
@@ -90,10 +93,18 @@ export function useActusPlatform(timeframe: ActusTimeframe) {
           })),
     ]);
 
+    if (refreshRequestRef.current !== requestId) {
+      return;
+    }
+
     const cards = getLiveBackendCards(timeframe);
     const contexts = getLiveHybridContexts(timeframe);
-    const seededInputs = contexts.map(normalizeHybridContext);
-    let fusedInputs: ActusNormalizedMarketInput[] = seededInputs;
+    const normalizedInputs = contexts.map(normalizeHybridContext);
+    const seededInputs = normalizedInputs.length > 0
+      ? normalizedInputs
+      : cards.length > 0
+        ? buildLiveBoardSeedInputs(cards, timeframe)
+        : visibleInputs;
 
     cachedMacroSnapshot = macroResult;
     cachedSystemSnapshot = systemResult;
@@ -108,18 +119,38 @@ export function useActusPlatform(timeframe: ActusTimeframe) {
     }
 
     if (cards.length > 0) {
-      try {
-        fusedInputs = await buildLiveBoardInputs(cards, timeframe);
-      } catch {
-        fusedInputs = seededInputs;
-      }
+      void buildLiveBoardInputs(cards, timeframe, {
+        seedInputs: seededInputs,
+        onProgress: (nextInputs) => {
+          if (refreshRequestRef.current !== requestId) {
+            return;
+          }
+
+          marketInputsCache[timeframe] = nextInputs;
+          setMarketInputs(nextInputs);
+          setRefreshTick((tick) => tick + 1);
+          setLoading(false);
+        },
+      }).catch(() => {
+        if (refreshRequestRef.current !== requestId) {
+          return;
+        }
+
+        if (seededInputs.length > 0) {
+          marketInputsCache[timeframe] = seededInputs;
+          setMarketInputs(seededInputs);
+        }
+        setRefreshTick((tick) => tick + 1);
+        setLoading(false);
+      });
+      return;
     }
 
-    marketInputsCache[timeframe] = fusedInputs;
-    setMarketInputs(fusedInputs);
+    marketInputsCache[timeframe] = seededInputs;
+    setMarketInputs(seededInputs);
     setRefreshTick((tick) => tick + 1);
     setLoading(false);
-  }, [timeframe]);
+  }, [marketInputs, timeframe]);
 
   useEffect(() => {
     const cachedInputs = marketInputsCache[timeframe];

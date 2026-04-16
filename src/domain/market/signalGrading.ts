@@ -6,8 +6,10 @@ import { evaluateSessionLogic } from "./sessionLogic";
 import { evaluateTrendBias } from "./trendBias";
 import type {
   ActusAction,
+  ActusBias,
   ActusConviction,
   ActusDirection,
+  ActusFreshnessState,
   ActusMacroInput,
   ActusNormalizedMarketInput,
   ActusOpportunityOutput,
@@ -122,6 +124,428 @@ function mapAction(
   if (confidenceScore < 78) return "wait";
   if (riskState === "unstable" || riskState === "late") return "avoid";
   return quality === "B" ? "wait" : "execute";
+}
+
+function directionMatchesTrend(direction: ActusDirection, bias: ActusBias) {
+  if (direction === "neutral" || bias === "neutral" || bias === "mixed") {
+    return true;
+  }
+  return (direction === "long" && bias === "bullish") || (direction === "short" && bias === "bearish");
+}
+
+function qualifiesForContinuationRelief(args: {
+  regime: ActusRegime;
+  direction: ActusDirection;
+  trendAligned: boolean;
+  state: ActusState;
+  adjustedConfidence: number;
+  adjustedOpportunity?: number;
+  quality: ActusTriggerQuality;
+  macroScore: number;
+  sessionScore: number;
+  vectorScore: number;
+  liquidityScore: number;
+  tooLateFlag?: boolean;
+  freshnessState?: ActusFreshnessState;
+}) {
+  if (args.direction === "neutral" || !args.trendAligned || args.tooLateFlag) {
+    return false;
+  }
+  if (args.freshnessState === "stale") {
+    return false;
+  }
+  if (args.regime !== "trend" && args.regime !== "expansion") {
+    return false;
+  }
+  if (args.state !== "continuation" && args.state !== "execute" && args.state !== "building") {
+    return false;
+  }
+  return args.adjustedConfidence >= 66 && args.vectorScore >= 62 && args.liquidityScore >= 58;
+}
+
+function qualifiesForContinuationPriority(args: {
+  regime: ActusRegime;
+  direction: ActusDirection;
+  trendAligned: boolean;
+  state: ActusState;
+  adjustedConfidence: number;
+  adjustedOpportunity: number;
+  quality: ActusTriggerQuality;
+  macroScore: number;
+  sessionScore: number;
+  vectorScore: number;
+  liquidityScore: number;
+  tooLateFlag?: boolean;
+  freshnessState?: ActusFreshnessState;
+  moduleConflictCount: number;
+  positioningConfidence?: "high" | "medium" | "low";
+}) {
+  if (
+    !qualifiesForContinuationRelief({
+      regime: args.regime,
+      direction: args.direction,
+      trendAligned: args.trendAligned,
+      state: args.state,
+      adjustedConfidence: args.adjustedConfidence,
+      adjustedOpportunity: args.adjustedOpportunity,
+      quality: args.quality,
+      macroScore: args.macroScore,
+      sessionScore: args.sessionScore,
+      vectorScore: args.vectorScore,
+      liquidityScore: args.liquidityScore,
+      tooLateFlag: args.tooLateFlag,
+      freshnessState: args.freshnessState,
+    })
+  ) {
+    return false;
+  }
+
+  if (args.moduleConflictCount > 0 || args.positioningConfidence === "low") {
+    return false;
+  }
+  if (args.freshnessState === "aging" || args.freshnessState === "stale") {
+    return false;
+  }
+
+  return (
+    args.adjustedConfidence >= 74 &&
+    args.adjustedOpportunity >= 68 &&
+    args.vectorScore >= 66 &&
+    args.liquidityScore >= 60 &&
+    args.macroScore >= 48 &&
+    args.sessionScore >= 52 &&
+    (args.quality === "A+" || args.quality === "A" || args.quality === "B")
+  );
+}
+
+function countModuleConflicts(scores: number[]) {
+  return scores.reduce((count, score) => count + (score < 55 ? 1 : 0), 0);
+}
+
+function tightenScoresForEliteFiltering(args: {
+  adjustedConfidence: number;
+  adjustedOpportunity: number;
+  freshnessState?: ActusFreshnessState;
+  stateAgeMinutes: number;
+  freshnessLimit: number;
+  riskState: ActusRiskState;
+  positioningConfidence?: "high" | "medium" | "low";
+  state: ActusState;
+  moduleConflictCount: number;
+  trendAligned: boolean;
+  continuationPriority?: boolean;
+}) {
+  let nextConfidence = args.adjustedConfidence;
+  let nextOpportunity = args.adjustedOpportunity;
+
+  if (args.freshnessState === "aging") {
+    nextConfidence -= 4;
+    nextOpportunity -= 3;
+  }
+  if (args.freshnessState === "stale") {
+    nextConfidence -= 8;
+    nextOpportunity -= 6;
+  }
+  if (args.stateAgeMinutes > Math.round(args.freshnessLimit * 0.7)) {
+    nextConfidence -= 3;
+    nextOpportunity -= 2;
+  }
+  if (args.riskState === "crowded" || args.positioningConfidence === "low") {
+    if (args.continuationPriority && args.riskState === "crowded" && args.positioningConfidence !== "low") {
+      nextConfidence -= 1;
+      nextOpportunity -= 1;
+    } else {
+      nextConfidence -= 4;
+      nextOpportunity -= 3;
+    }
+  }
+  if (args.state === "building" || args.state === "watching" || args.state === "balanced" || args.state === "waiting") {
+    if (args.continuationPriority && args.state === "building") {
+      nextConfidence -= 1;
+      nextOpportunity -= 1;
+    } else {
+      nextConfidence -= 3;
+      nextOpportunity -= 2;
+    }
+  }
+  if (args.moduleConflictCount >= 2) {
+    nextConfidence -= 6;
+    nextOpportunity -= 4;
+  } else if (args.moduleConflictCount === 1) {
+    nextConfidence -= 2;
+    nextOpportunity -= 1;
+  }
+  if (!args.trendAligned) {
+    nextConfidence -= 4;
+    nextOpportunity -= 3;
+  }
+
+  return {
+    confidence: clamp(nextConfidence, 0, 100),
+    opportunity: clamp(nextOpportunity, 0, 100),
+  };
+}
+
+function classifyEliteAction(args: {
+  direction: ActusDirection;
+  quality: ActusTriggerQuality;
+  riskState: ActusRiskState;
+  confidence: number;
+  opportunity: number;
+  state: ActusState;
+  tooLateFlag?: boolean;
+  freshnessState?: ActusFreshnessState;
+  moduleConflictCount: number;
+  trendAligned: boolean;
+  macroScore: number;
+  vectorScore: number;
+  liquidityScore: number;
+  sessionScore: number;
+  positioningConfidence?: "high" | "medium" | "low";
+  continuationPriority?: boolean;
+}) : ActusAction {
+  const clearlyAvoid =
+    args.tooLateFlag ||
+    args.riskState === "late" ||
+    args.state === "failed-breakout" ||
+    args.state === "invalidated";
+
+  const unstableAvoid =
+    args.riskState === "unstable" &&
+    (args.confidence < 64 || args.opportunity < 60 || args.state === "exhaustion");
+
+  const severeConflict =
+    args.moduleConflictCount >= 3 ||
+    (args.moduleConflictCount >= 2 && args.confidence < 62 && args.opportunity < 58) ||
+    (!args.trendAligned && args.confidence < 64 && args.opportunity < 60);
+
+  if (
+    clearlyAvoid ||
+    unstableAvoid ||
+    severeConflict ||
+    (args.state === "exhaustion" && args.confidence < 64) ||
+    (args.riskState === "crowded" && args.confidence < 58 && args.opportunity < 54)
+  ) {
+    return "avoid";
+  }
+
+  const eliteExecute =
+    args.direction !== "neutral" &&
+    (args.state === "execute" || args.state === "breakout" || args.state === "continuation") &&
+    (args.quality === "A+" || args.quality === "A") &&
+    args.riskState === "clean" &&
+    args.confidence >= 80 &&
+    args.opportunity >= 72 &&
+    args.moduleConflictCount === 0 &&
+    args.trendAligned &&
+    args.macroScore >= 52 &&
+    args.vectorScore >= 64 &&
+    args.liquidityScore >= 60 &&
+    args.sessionScore >= 56 &&
+    args.freshnessState !== "aging" &&
+    args.freshnessState !== "stale" &&
+    args.positioningConfidence !== "low";
+
+  const exceptionalBExecute =
+    args.direction !== "neutral" &&
+    (args.state === "execute" || args.state === "breakout" || args.state === "continuation") &&
+    args.quality === "B" &&
+    (args.riskState === "clean" || args.riskState === "crowded") &&
+    args.confidence >= 84 &&
+    args.opportunity >= 78 &&
+    args.moduleConflictCount === 0 &&
+    args.trendAligned &&
+    args.macroScore >= 58 &&
+    args.vectorScore >= 70 &&
+    args.liquidityScore >= 66 &&
+    args.sessionScore >= 60 &&
+    args.freshnessState !== "aging" &&
+    args.freshnessState !== "stale" &&
+    args.positioningConfidence !== "low";
+
+  const continuationExecute =
+    Boolean(args.continuationPriority) &&
+    args.direction !== "neutral" &&
+    (args.state === "execute" || args.state === "breakout" || args.state === "continuation" || args.state === "building") &&
+    (args.quality === "A+" || args.quality === "A" || args.quality === "B") &&
+    (args.riskState === "clean" || args.riskState === "crowded") &&
+    args.confidence >= 78 &&
+    args.opportunity >= 70 &&
+    args.moduleConflictCount === 0 &&
+    args.trendAligned &&
+    args.macroScore >= 50 &&
+    args.vectorScore >= 66 &&
+    args.liquidityScore >= 60 &&
+    args.sessionScore >= 54 &&
+    args.freshnessState !== "aging" &&
+    args.freshnessState !== "stale" &&
+    args.positioningConfidence !== "low";
+
+  const confirmedLiveContinuationExecute =
+    args.direction !== "neutral" &&
+    args.state === "execute" &&
+    args.quality === "B" &&
+    (args.riskState === "clean" || args.riskState === "crowded") &&
+    args.confidence >= 76 &&
+    args.opportunity >= 74 &&
+    args.moduleConflictCount <= 1 &&
+    args.trendAligned &&
+    args.macroScore >= 48 &&
+    args.vectorScore >= 66 &&
+    args.liquidityScore >= 60 &&
+    args.sessionScore >= 50 &&
+    args.freshnessState !== "aging" &&
+    args.freshnessState !== "stale" &&
+    args.positioningConfidence !== "low";
+
+  if (eliteExecute || exceptionalBExecute || continuationExecute || confirmedLiveContinuationExecute) {
+    return "execute";
+  }
+
+  return "wait";
+}
+
+function shouldPreserveQualifiedLiveExecute(args: {
+  liveAction?: ActusAction;
+  liveState?: ActusState;
+  freshnessState?: ActusFreshnessState;
+  tooLateFlag?: boolean;
+  invalidationWarning?: string | null;
+}) {
+  if (args.liveAction !== "execute" || args.liveState !== "execute") {
+    return false;
+  }
+  if (args.tooLateFlag || args.invalidationWarning) {
+    return false;
+  }
+  if (args.freshnessState === "stale") {
+    return false;
+  }
+  return true;
+}
+
+function actionRank(action: ActusAction) {
+  if (action === "execute") return 2;
+  if (action === "wait") return 1;
+  return 0;
+}
+
+function demoteLiveAction(
+  liveAction: ActusAction,
+  computedAction: ActusAction,
+  options?: {
+    liveState?: ActusState;
+    stateConfidence?: number;
+    freshnessState?: ActusFreshnessState;
+    trendContinuation?: boolean;
+    tooLateFlag?: boolean;
+    invalidationWarning?: string | null;
+  },
+) {
+  if (
+    liveAction === "execute" &&
+    computedAction === "wait" &&
+    options?.liveState === "execute" &&
+    !options.tooLateFlag &&
+    !options.invalidationWarning &&
+    options.freshnessState !== "aging" &&
+    options.freshnessState !== "stale" &&
+    options.stateConfidence !== undefined &&
+    (options.stateConfidence >= 80 || (options.stateConfidence >= 90 && options.trendContinuation))
+  ) {
+    return liveAction;
+  }
+  return actionRank(computedAction) < actionRank(liveAction) ? computedAction : liveAction;
+}
+
+function canRecoverFromLateState(args: {
+  computedAction: ActusAction;
+  computedState: ActusState;
+  adjustedConfidence: number;
+  riskState: ActusRiskState;
+  tooLateFlag?: boolean;
+  invalidationWarning?: string | null;
+  direction: ActusDirection;
+}) {
+  if (args.tooLateFlag || args.invalidationWarning) {
+    return false;
+  }
+  if (args.direction === "neutral") {
+    return false;
+  }
+  if (args.riskState === "late" || args.riskState === "unstable") {
+    return false;
+  }
+  if (args.computedAction === "avoid") {
+    return false;
+  }
+  if (args.computedAction === "execute") {
+    return args.adjustedConfidence >= 82;
+  }
+  return (
+    args.adjustedConfidence >= 64 &&
+    (args.computedState === "building" || args.computedState === "watching" || args.computedState === "continuation")
+  );
+}
+
+function recoverLiveAction(
+  liveAction: ActusAction,
+  computedAction: ActusAction,
+  canRecover: boolean,
+) {
+  if (!canRecover) {
+    return liveAction;
+  }
+  return actionRank(computedAction) > actionRank(liveAction) ? computedAction : liveAction;
+}
+
+function demoteLiveState(
+  state: ActusState,
+  action: ActusAction,
+  riskState: ActusRiskState,
+  tooLateFlag?: boolean,
+  invalidationWarning?: string | null,
+): ActusState {
+  if (state !== "execute") {
+    return state;
+  }
+
+  if (action === "execute") {
+    return state;
+  }
+
+  if (action === "avoid" || tooLateFlag || riskState === "late" || riskState === "unstable" || invalidationWarning) {
+    return "exhaustion";
+  }
+
+  return "watching";
+}
+
+function recoverLiveState(
+  state: ActusState,
+  computedState: ActusState,
+  action: ActusAction,
+  canRecover: boolean,
+): ActusState {
+  if (!canRecover) {
+    return state;
+  }
+
+  if (action === "execute") {
+    return state === "execute" || computedState === "continuation" || computedState === "breakout"
+      ? "execute"
+      : "building";
+  }
+
+  if (computedState === "continuation") {
+    return "building";
+  }
+
+  if (computedState === "balanced") {
+    return "watching";
+  }
+
+  return computedState;
 }
 
 function actionLabel(action: ActusAction) {
@@ -396,6 +820,10 @@ export function buildActusOpportunity(
   const liveWarnings = [input.liveState?.decayWarning, input.liveState?.invalidationWarning, ...(input.positioningContext?.warnings ?? [])].filter(
     Boolean,
   ) as string[];
+  const activeInvalidationWarning =
+    input.liveState?.currentState === "Invalidated"
+      ? input.liveState.invalidationWarning
+      : null;
 
   if (input.liveState) {
     adjustedConfidence = clamp(Math.round(adjustedConfidence * 0.4 + input.liveState.stateConfidence * 0.6), 0, 100);
@@ -410,11 +838,141 @@ export function buildActusOpportunity(
 
     if (input.liveState.tooLateFlag) {
       riskState = "late";
-    } else if (input.liveState.invalidationWarning) {
+    } else if (activeInvalidationWarning) {
       riskState = "unstable";
     } else if (input.positioningContext?.confidence === "low" && action !== "execute") {
       riskState = "crowded";
     }
+  }
+
+  const computedState = mapState(initialDirection, liquidity.state, session.state);
+  const computedAction = mapAction(initialDirection, quality, riskState, adjustedConfidence);
+  if (input.liveState) {
+    const canRecover = canRecoverFromLateState({
+      computedAction,
+      computedState,
+        adjustedConfidence,
+        riskState,
+        tooLateFlag: input.liveState.tooLateFlag,
+        invalidationWarning: activeInvalidationWarning,
+        direction: initialDirection,
+      });
+    action = recoverLiveAction(action, computedAction, canRecover);
+    action = demoteLiveAction(action, computedAction, {
+      liveState: mapLiveCurrentState(input.liveState.currentState),
+      stateConfidence: input.liveState.stateConfidence,
+      freshnessState: input.liveState.freshnessState,
+      trendContinuation: Boolean(input.liveState.debug?.rawStateInputs?.trendContinuation),
+      tooLateFlag: input.liveState.tooLateFlag,
+      invalidationWarning: activeInvalidationWarning,
+    });
+    state = recoverLiveState(state, computedState, action, canRecover);
+    state = demoteLiveState(
+      state,
+      action,
+      riskState,
+      input.liveState.tooLateFlag,
+      activeInvalidationWarning,
+    );
+  } else {
+    action = computedAction;
+  }
+
+  const moduleConflictCount = countModuleConflicts([
+    trend.result.score,
+    vector.result.score,
+    liquidity.result.score,
+    session.result.score,
+    macroCheck.result.score,
+  ]);
+  const trendAligned = directionMatchesTrend(initialDirection, trend.bias);
+  const continuationRelief = qualifiesForContinuationRelief({
+    regime,
+    direction: initialDirection,
+    trendAligned,
+    state,
+    adjustedConfidence,
+    adjustedOpportunity,
+    quality,
+    macroScore: macroCheck.result.score,
+    sessionScore: session.result.score,
+    vectorScore: vector.result.score,
+    liquidityScore: liquidity.result.score,
+    tooLateFlag: input.liveState?.tooLateFlag,
+    freshnessState: input.liveState?.freshnessState,
+  });
+  const continuationPriority = qualifiesForContinuationPriority({
+    regime,
+    direction: initialDirection,
+    trendAligned,
+    state,
+    adjustedConfidence,
+    adjustedOpportunity,
+    quality,
+    macroScore: macroCheck.result.score,
+    sessionScore: session.result.score,
+    vectorScore: vector.result.score,
+    liquidityScore: liquidity.result.score,
+    tooLateFlag: input.liveState?.tooLateFlag,
+    freshnessState: input.liveState?.freshnessState,
+    moduleConflictCount,
+    positioningConfidence: input.positioningContext?.confidence,
+  });
+  if (continuationRelief) {
+    if (riskState === "late") {
+      riskState = "clean";
+    } else if (riskState === "crowded" && (quality !== "B" || continuationPriority)) {
+      riskState = "clean";
+    }
+  }
+  const tightenedScores = tightenScoresForEliteFiltering({
+    adjustedConfidence,
+    adjustedOpportunity,
+    freshnessState: input.liveState?.freshnessState,
+    stateAgeMinutes,
+    freshnessLimit,
+    riskState,
+    positioningConfidence: input.positioningContext?.confidence,
+    state,
+    moduleConflictCount,
+    trendAligned,
+    continuationPriority,
+  });
+  adjustedConfidence = tightenedScores.confidence;
+  adjustedOpportunity = tightenedScores.opportunity;
+  adjustedConviction = mapConviction(adjustedConfidence);
+  action = classifyEliteAction({
+    direction,
+    quality,
+    riskState,
+    confidence: adjustedConfidence,
+    opportunity: adjustedOpportunity,
+    state,
+    tooLateFlag: input.liveState?.tooLateFlag,
+    freshnessState: input.liveState?.freshnessState,
+    moduleConflictCount,
+    trendAligned,
+    macroScore: macroCheck.result.score,
+    vectorScore: vector.result.score,
+    liquidityScore: liquidity.result.score,
+    sessionScore: session.result.score,
+    positioningConfidence: input.positioningContext?.confidence,
+    continuationPriority,
+  });
+  if (
+    shouldPreserveQualifiedLiveExecute({
+      liveAction: input.liveState?.action,
+      liveState: mapLiveCurrentState(input.liveState?.currentState ?? "Waiting"),
+      freshnessState: input.liveState?.freshnessState,
+      tooLateFlag: input.liveState?.tooLateFlag,
+      invalidationWarning: activeInvalidationWarning,
+    })
+  ) {
+    action = "execute";
+    state = "execute";
+  }
+  if (action === "execute" && continuationPriority && state === "building") {
+    state = "execute";
   }
 
   direction = resolveExecuteDirection(direction, state, action, input, hybrid, vector.direction);

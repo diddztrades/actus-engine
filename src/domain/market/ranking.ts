@@ -1,9 +1,9 @@
 import type { ActusOpportunityOutput, ActusRankedOpportunity } from "./types";
 
 function actionWeight(action: ActusOpportunityOutput["action"]) {
-  if (action === "execute") return 12;
-  if (action === "wait") return 4;
-  return -8;
+  if (action === "execute") return 18;
+  if (action === "wait") return 1;
+  return -14;
 }
 
 function qualityWeight(quality: ActusOpportunityOutput["triggerQuality"]) {
@@ -14,16 +14,16 @@ function qualityWeight(quality: ActusOpportunityOutput["triggerQuality"]) {
 }
 
 function riskWeight(riskState: ActusOpportunityOutput["riskState"]) {
-  if (riskState === "clean") return 10;
-  if (riskState === "crowded") return -6;
-  if (riskState === "late") return -14;
-  return -12;
+  if (riskState === "clean") return 12;
+  if (riskState === "crowded") return -9;
+  if (riskState === "late") return -18;
+  return -15;
 }
 
 function convictionWeight(conviction: ActusOpportunityOutput["conviction"]) {
-  if (conviction === "high") return 8;
-  if (conviction === "medium") return 2;
-  return -8;
+  if (conviction === "high") return 10;
+  if (conviction === "medium") return 0;
+  return -10;
 }
 
 export function rankActusOpportunities(list: ActusOpportunityOutput[]): ActusRankedOpportunity[] {

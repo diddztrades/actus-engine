@@ -292,7 +292,7 @@ function deriveDeltaFusion(
 
   if (signal.deltaAvailability === "SOURCE_ONLY") {
     return {
-      confidenceDelta: condition === "TRAP" ? 0 : 0.008,
+      confidenceDelta: condition === "TRAP" ? 0 : 0.005,
       driver: "flow present, not directional",
     };
   }
@@ -309,13 +309,13 @@ function deriveDeltaFusion(
 
   if (deltaBias === bias) {
     return {
-      confidenceDelta: round(0.014 + strength * 0.028, 3),
+      confidenceDelta: round(0.02 + strength * 0.034, 3),
       driver: "delta aligned",
     };
   }
 
   return {
-    confidenceDelta: round(-(0.038 + strength * 0.045), 3),
+    confidenceDelta: round(-(0.05 + strength * 0.055), 3),
     driver: "delta conflict",
   };
 }

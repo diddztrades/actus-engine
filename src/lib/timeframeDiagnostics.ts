@@ -15,17 +15,14 @@ type FetchDiagnostic = {
 };
 
 export function logTimeframeFetch({ symbol, timeframe, requested, candles }: FetchDiagnostic) {
-  console.log("[ACTUS][TF CHECK]", {
-    symbol,
-    timeframe,
-    requested: requested ?? null,
-    received: candles.length,
-    first: candles[0]?.timestamp ?? null,
-    last: candles[candles.length - 1]?.timestamp ?? null,
-  });
+  void symbol;
+  void timeframe;
+  void requested;
+  void candles;
 }
 
 export function validateCandleSpacing(symbol: string, timeframe: MarketTimeframe, candles: Pick<NormalizedFuturesCandle, "timestamp">[]) {
+  void symbol;
   const expected = EXPECTED_SPACING_SECONDS[timeframe];
   if (!expected || candles.length < 2) {
     return;
@@ -37,15 +34,7 @@ export function validateCandleSpacing(symbol: string, timeframe: MarketTimeframe
     const diff = current - previous;
 
     if (diff !== expected) {
-      console.warn("[ACTUS][TF GAP]", {
-        symbol,
-        timeframe,
-        index,
-        expected,
-        actual: diff,
-        previous: candles[index - 1].timestamp,
-        current: candles[index].timestamp,
-      });
+      return;
     }
   }
 }

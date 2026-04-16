@@ -313,11 +313,43 @@ function deriveMetrics(card) {
   const supportGap = Math.abs(card.priceLevel - card.support) / Math.max(card.priceLevel, 0.0001);
   const gDist = Math.abs(card.priceLevel - card.greenLine) / Math.max(card.priceLevel, 0.0001);
   const rDist = Math.abs(card.priceLevel - card.redLine) / Math.max(card.priceLevel, 0.0001);
+  const nqTightContinuation =
+    card.symbol === "NQ" &&
+    directionalAlignment &&
+    !unstable &&
+    !quiet &&
+    !stretched &&
+    supportGap <= 0.0025 &&
+    entryGap <= 0.0065 &&
+    (
+      (card.bias === "LONG" && zone === "FAVORABLE" && card.changePercent >= 0.14 && card.momentum >= 0.006) ||
+      (card.bias === "SHORT" && zone === "UNFAVORABLE" && card.changePercent <= -0.14 && card.momentum <= -0.006)
+    );
+  const continuationCandidate =
+    (
+      directionalAlignment &&
+      !unstable &&
+      !quiet &&
+      ((card.bias === "LONG" && card.changePercent > 0.45 && card.momentum > 0.18) ||
+        (card.bias === "SHORT" && card.changePercent < -0.45 && card.momentum < -0.18))
+    ) ||
+    nqTightContinuation;
+  const trendContinuation =
+    (
+      continuationCandidate &&
+      strongTrend &&
+      momentumStrong &&
+      ((card.bias === "LONG" && zone !== "UNFAVORABLE") || (card.bias === "SHORT" && zone !== "FAVORABLE"))
+    ) ||
+    (
+      nqTightContinuation &&
+      ((card.bias === "LONG" && zone === "FAVORABLE") || (card.bias === "SHORT" && zone === "UNFAVORABLE"))
+    );
 
-  const tooLate =
+  const lateExtension =
     (card.bias === "LONG" && card.changePercent > 1.35 && (crowded || stretched)) ||
-    (card.bias === "SHORT" && card.changePercent < -1.35 && (crowded || stretched)) ||
-    entryGap > 0.011;
+    (card.bias === "SHORT" && card.changePercent < -1.35 && (crowded || stretched));
+  const tooLate = !trendContinuation && (lateExtension || entryGap > 0.011);
 
   return {
     zone,
@@ -330,6 +362,8 @@ function deriveMetrics(card) {
     unstable,
     quiet,
     directionalAlignment,
+    continuationCandidate,
+    trendContinuation,
     invalidated,
     entryGap,
     supportGap,
@@ -368,22 +402,25 @@ function buildBaseScore(card, metrics) {
 
   if (card.rsi >= 50 && card.rsi <= 63) score += 11;
   else if (card.rsi >= 46 && card.rsi <= 67) score += 4;
-  if (metrics.crowded) score -= 10;
-  if (metrics.stretched) score -= 18;
+  if (metrics.crowded) score -= metrics.trendContinuation ? 4 : 10;
+  if (metrics.stretched) score -= metrics.trendContinuation ? 8 : 18;
   if (metrics.strongTrend) score += 7;
   if (metrics.weakTrend) score -= 14;
   if (metrics.momentumStrong) score += 6;
   if (metrics.momentumWeak) score -= 10;
   if (metrics.unstable) score -= 12;
   if (metrics.directionalAlignment) score += 12;
+  if (metrics.continuationCandidate) score += 8;
+  if (metrics.trendContinuation) score += 12;
   if (card.bias === "LONG" && metrics.gDist < 0.0025) score += 6;
   if (card.bias === "SHORT" && metrics.rDist < 0.0025) score += 6;
+  if (metrics.continuationCandidate && metrics.entryGap <= 0.0075) score += 6;
   if (metrics.entryGap > 0.009) score -= 8;
   if (metrics.supportGap > 0.015) score -= 6;
   if (metrics.zone === "NEUTRAL" && metrics.weakTrend && metrics.momentumWeak) score -= 20;
   if (metrics.zone === "NEUTRAL" && !metrics.directionalAlignment) score -= 8;
   if (metrics.quiet) score -= 14;
-  if (metrics.tooLate) score -= 12;
+  if (metrics.tooLate) score -= metrics.trendContinuation ? 4 : 12;
   if (metrics.invalidated) score -= 24;
 
   return clamp(score, 0, 100);
@@ -398,6 +435,12 @@ function buildReasons(card, metrics, score) {
     reasons.push("Price is still sitting in a neutral decision zone.");
   } else {
     reasons.push("Directional control is still mixed.");
+  }
+
+  if (metrics.trendContinuation) {
+    reasons.push("Trend continuation is intact and still behaving cleanly.");
+  } else if (metrics.continuationCandidate) {
+    reasons.push("Trend structure is rebuilding toward a continuation entry.");
   }
 
   if (metrics.tooLate) {
@@ -444,25 +487,43 @@ function buildDecisionState(card, timeframe, stateAgeMinutes, progressionContext
     currentState = "Invalidated";
     action = "AVOID";
     invalidationWarning = "Structure failed the invalidation test.";
-  } else if (metrics.tooLate && score >= 62) {
+  } else if (metrics.tooLate && score >= 62 && !metrics.continuationCandidate) {
     currentState = "Exhaustion";
     action = "WAIT";
   } else if (
-    score >= 72 &&
-    metrics.directionalAlignment &&
-    !metrics.crowded &&
-    !metrics.stretched &&
-    !metrics.unstable &&
-    !metrics.tooLate &&
-    metrics.entryGap <= 0.0105
+    (
+      score >= 72 &&
+      metrics.directionalAlignment &&
+      !metrics.crowded &&
+      !metrics.stretched &&
+      !metrics.unstable &&
+      !metrics.tooLate &&
+      metrics.entryGap <= 0.0105
+    ) ||
+    (
+      metrics.trendContinuation &&
+      score >= 70 &&
+      !metrics.invalidated &&
+      !metrics.stretched &&
+      !metrics.tooLate &&
+      metrics.entryGap <= 0.013
+    )
   ) {
     currentState = "Execute";
     action = "EXECUTE";
   } else if (
-    score >= 66 &&
-    metrics.directionalAlignment &&
-    !metrics.invalidated &&
-    !metrics.unstable
+    (
+      score >= 66 &&
+      metrics.directionalAlignment &&
+      !metrics.invalidated &&
+      !metrics.unstable
+    ) ||
+    (
+      metrics.continuationCandidate &&
+      score >= 60 &&
+      !metrics.invalidated &&
+      !metrics.tooLate
+    )
   ) {
     currentState = "Building";
     action = "WAIT";
@@ -514,22 +575,42 @@ function buildDecisionState(card, timeframe, stateAgeMinutes, progressionContext
     score = clamp(score + (progressionContext.resolutionBonus ?? 0), 0, 100);
 
     if (
-      score >= 72 &&
-      metrics.directionalAlignment &&
-      !metrics.crowded &&
-      !metrics.stretched &&
-      !metrics.unstable &&
-      metrics.entryGap <= 0.0105
+      (
+        score >= 72 &&
+        metrics.directionalAlignment &&
+        !metrics.crowded &&
+        !metrics.stretched &&
+        !metrics.unstable &&
+        metrics.entryGap <= 0.0105
+      ) ||
+      (
+        metrics.trendContinuation &&
+        score >= 70 &&
+        !metrics.invalidated &&
+        !metrics.stretched &&
+        !metrics.tooLate &&
+        metrics.entryGap <= 0.013
+      )
     ) {
       currentState = "Execute";
       action = "EXECUTE";
       decayWarning = "The setup is resolving off the trigger.";
     } else if (
       currentState === "Watching" &&
-      score >= 66 &&
-      metrics.directionalAlignment &&
-      !metrics.invalidated &&
-      !metrics.unstable
+      (
+        (
+          score >= 66 &&
+          metrics.directionalAlignment &&
+          !metrics.invalidated &&
+          !metrics.unstable
+        ) ||
+        (
+          metrics.continuationCandidate &&
+          score >= 60 &&
+          !metrics.invalidated &&
+          !metrics.tooLate
+        )
+      )
     ) {
       currentState = "Building";
       action = "WAIT";
@@ -588,7 +669,8 @@ function buildDecisionState(card, timeframe, stateAgeMinutes, progressionContext
     currentState = "Waiting";
     action = "WAIT";
     score = clamp(score + 4, 0, 100);
-    invalidationWarning = "Invalidation has cooled off. Wait for a fresh rebuild.";
+    invalidationWarning = null;
+    decayWarning = "Invalidation has cooled off. Wait for a fresh rebuild.";
   }
 
   const baseFreshness = buildFreshnessScore(currentState, effectiveStateAgeMinutes, limits);
@@ -667,6 +749,8 @@ function buildDecisionState(card, timeframe, stateAgeMinutes, progressionContext
         greenLineDistance: Number(metrics.gDist.toFixed(6)),
         redLineDistance: Number(metrics.rDist.toFixed(6)),
         directionalAlignment: metrics.directionalAlignment,
+        continuationCandidate: metrics.continuationCandidate,
+        trendContinuation: metrics.trendContinuation,
         invalidated: metrics.invalidated,
         tooLate: metrics.tooLate,
         stretched: metrics.stretched,
@@ -771,22 +855,17 @@ function finalizeStateBoard(cards, timeframe) {
       return card;
     }
 
-    const nextScore = clamp(card.score - 8, 0, 100);
+    const stackedReason = "Another execution-qualified setup currently has higher board priority.";
     return {
       ...card,
-      action: "WAIT",
-      currentState: "Building",
       status: "STACKED",
-      score: nextScore,
-      quality: quality(nextScore),
-      stateConfidence: clamp(card.stateConfidence - 6, 0, 100),
-      decayWarning: "A stronger setup currently has execution priority.",
-      reasons: [...card.reasons, "This setup stays interesting, but it is not the cleanest trigger on the board."].slice(0, 4),
+      decayWarning: "Another execution-qualified setup currently has higher board priority.",
+      reasons: [...card.reasons, stackedReason].slice(0, 4),
       stateDebug: {
         ...card.stateDebug,
-        chosenState: "Building",
-        stateConfidence: clamp(card.stateConfidence - 6, 0, 100),
-        topReasons: [...card.reasons, "This setup stays interesting, but it is not the cleanest trigger on the board."].slice(0, 3),
+        chosenState: "Execute",
+        stateConfidence: card.stateConfidence,
+        topReasons: [...card.reasons, stackedReason].slice(0, 3),
       },
     };
   });
